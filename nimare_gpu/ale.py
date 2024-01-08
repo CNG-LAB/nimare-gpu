@@ -14,7 +14,12 @@ from numba import cuda
 
 from nimare.meta.cbma.ale import ALE, SCALE
 from nimare.meta.utils import _calculate_cluster_measures
-from nimare.stats import null_to_p, nullhist_to_p
+from nimare.stats import null_to_p
+from nimare_gpu.stats import nullhist_to_p  # includes an option to skip checking min p-value
+
+from numpy.lib.histograms import _get_bin_edges
+
+
 from nimare.transforms import p_to_z
 from nimare.utils import (
     _check_ncores,
@@ -28,6 +33,7 @@ from nimare_gpu.utils import get_ale_kernel
 
 LGR = logging.getLogger(__name__)
 
+# GPU kernels
 @cuda.jit()
 def compute_ma_gpu(
         ma_maps, ijks,
@@ -114,6 +120,51 @@ def compute_ma_gpu(
                             # memory race (though is unlikely)
                             cuda.atomic.max(ma_maps, (0, i_exp, vox), kernels[i_exp, xlk+xi, ylk+yi, zlk+zi])
 
+@cuda.jit(cache=False)
+def compute_hist(X, bins, n_bins, Y):
+    """
+    Calculates histogram of X (n_var, n_obs) and stores it in Y (n_var, n_bins).
+    The histogram of each row (variable) is calculated independently and in parallel,
+    on different blocks (grid.x). Each thread does the calculations of one observation
+    and the threads may be distributed across several blocks (grid.y) depending
+    on the number of observations and the number of threads per block (block.x).
+
+    Parameters
+    ----------
+    X: (cp.ndarray) (n_var, n_obs)
+        data to calculate histogram of
+    bins: (cp.ndarray) (n_bins,)
+        bins of histogram
+    n_bins: (int)
+        number of bins
+    Y: (cp.ndarray) (n_var, n_bins)
+        histogram of X
+    """
+    # get current observation value
+    row_idx = cuda.blockIdx.x
+    element_idx = cuda.threadIdx.x + cuda.blockIdx.y * cuda.blockDim.x
+    if (row_idx >= X.shape[0]) or (element_idx >= X.shape[1]):
+        return
+    x = X[row_idx, element_idx]
+    if (x < bins[0] or bins[n_bins-1] < x):
+        # to ignore NaNs, set them to a value outside the bins
+        # e.g. -1 for ALE nulls
+        return
+    # find the bin that x belongs to
+    high = n_bins - 1
+    low = 0
+    while (high - low > 1):
+        mid = int((high + low) / 2)
+        if bins[mid] <= x:
+            low = mid
+        else:
+            high = mid
+    # add 1 to the count of the bin
+    # (must be done atomically)
+    cuda.atomic.add(Y, (row_idx, low), 1)
+
+
+# GPU adapation of NiMARE's ALE and SCALE
 class DeviceMixin:
     """
     Mixin class for GPU-enabled estimators.
@@ -642,6 +693,7 @@ class DeviceALE(DeviceMixin, ALE):
 
 class DeviceSCALE(DeviceMixin, SCALE):
     keep_perm_nulls = False # TODO: add user option to change this
+    use_cpu = False # for debugging/testing TODO: add user option to change this
     @use_memmap(LGR, n_files=2)
     def _fit(self, dataset, batch_size=1, calculate_z_std=True):
         """Perform specific coactivation likelihood estimation meta-analysis on dataset
@@ -826,7 +878,9 @@ class DeviceSCALE(DeviceMixin, SCALE):
         )
         return z_values
 
-    def _scale_to_p(self, stat_values, scale_values):
+    def _scale_to_p(self, stat_values, scale_values, 
+                    vox_batch_size=1000, n_elements_per_block=1000,
+                    use_cpu=False):
         # added this temporarily to show tqdm for troubleshooting
         """Compute p- and z-values.
 
@@ -836,6 +890,13 @@ class DeviceSCALE(DeviceMixin, SCALE):
             ALE values.
         scale_values : (I x V) array
             Permutation ALE values.
+        vox_batch_size : :obj:`int`, optional
+            Number of voxels to process in each batch. Default is 1000.
+        n_elements_per_block : :obj:`int`, optional
+            Number of elements (observations) processed in each GPU block. 
+            Corresponds to the number of threads in each block, and must
+            be below the max number of threads per block on the GPU device
+            (usually 1024). Default is 1000.
 
         Returns
         -------
@@ -846,16 +907,84 @@ class DeviceSCALE(DeviceMixin, SCALE):
         -----
         This method also uses the "histogram_bins" element in the null_distributions_ attribute.
         """
-        from nimare.transforms import p_to_z
-        n_voxels = stat_values.shape[0]
+        if self.use_cpu:
+            # note that the results are not going to be identical
+            # (with small number of permutations)
+            # because of different treatment of min p-value
+            return super()._scale_to_p(stat_values, scale_values)
+        n_vox = scale_values.shape[1]
+        n_perm = scale_values.shape[0]
+        # calculate number of voxel batches and number of GPU blocks
+        # needed per permutation
+        n_batches = int(np.ceil(n_vox / vox_batch_size)) # batches of voxels
+        ## make sure n_elements_per_block is not > n_perm
+        n_elements_per_block = min(n_elements_per_block, n_perm)
+        n_blocks_per_perm = int(np.ceil(n_perm / n_elements_per_block))
+        # set 0s to -1; not using NaN because
+        # not sure if NaNs can be handled consistently
+        # on GPU, i.e., np.NaN float value might be different
+        # and I wouldn't trust it to do a value == np.NaN check
+        # on the GPU kernel
+        scale_values[scale_values==0] = -1.0
+        # count number of zeros in the permutations of each voxel
+        n_zeros = (scale_values==-1.0).sum(axis=0)
+        # define histogram bins
+        n_bins = self.null_distributions_["histogram_bins"].shape[0]
+        hist_min = np.min(self.null_distributions_["histogram_bins"])
+        hist_max = np.max(self.null_distributions_["histogram_bins"])
+        # define bin edges: note that although the null value of an example 
+        # voxel (first voxel)  is included in the input of this function it 
+        # is not needed to recalculate it for every voxel, because when number
+        # of bins is fixed and range is provided _get_bin_edges is only
+        # going to get the linspace of range and via _get_outer_edge do some
+        # checks on the range, and if (a.min(), a.max()) is outside the range 
+        # raise an error
+        bin_edges = _get_bin_edges(scale_values[:, 0], self.null_distributions_["histogram_bins"], (hist_min, hist_max), None)[0]
+        bin_edges = cupy.asarray(bin_edges) # copy to GPU
+        # initialize voxel histograms (of each batch) on GPU as zeros
+        voxel_hists = cupy.zeros((vox_batch_size, n_bins), dtype=cupy.int32)
+        # all_voxel_hists = np.zeros((n_vox, n_bins), dtype=np.int32) # uncomment to keep all hists
+        p_values = np.zeros(n_vox)
+        # get mempool for GPU memory management
+        mempool = cupy.get_default_memory_pool() 
+        for i_batch in tqdm(range(n_batches)):
+            # reset histograms to all 0s
+            voxel_hists.fill(0)
+            vox_start = vox_batch_size*i_batch
+            vox_end = min(vox_start+vox_batch_size, n_vox)
+            curr_batch_size = vox_end - vox_start
+            # set the number of zeros in each voxel of this batch
+            voxel_hists[:curr_batch_size, 0] = cupy.asarray(n_zeros[vox_start:vox_end], dtype=cupy.int32)
+            # copy permutation ALE values of this batch to GPU
+            # and reshape it to (n_vox, n_perm)
+            voxel_nulls = cupy.asarray(scale_values[:, vox_start:vox_end].T, dtype=cupy.float32)
+            # call the historgram calculation kernel on GPU
+            # with rows (voxels) distributed across grid.x
+            # and observations (permutations) distributed across
+            # grid.y and block.x
+            compute_hist[(curr_batch_size, n_blocks_per_perm,), (n_elements_per_block,)](
+                voxel_nulls, 
+                bin_edges,
+                n_bins, 
+                voxel_hists[:, 1:], # first bin is excluded as it includes n of zeros
+            )
+            # copy histogram to CPU (and execute the kernel)
+            voxel_hists_ = voxel_hists.get()
+            # calculate p-values, without setting the min
+            # p-value to smallest value of null distribution
+            # as null distribution and its smallest value is
+            # different in each batch of voxels
+            p_values[vox_start:vox_end] = nullhist_to_p(
+                stat_values[vox_start:vox_end],
+                voxel_hists_[:curr_batch_size,:].T,
+                self.null_distributions_["histogram_bins"],
+                min_check=False
+            )
+            # all_voxel_hists[vox_start:vox_end, :] = voxel_hists_[:curr_batch_size, :] # uncomment to keep all hists
+            # free GPU memory
+            del voxel_nulls
+            mempool.free_all_blocks()
 
-        # I know that joblib probably preserves order of outputs, but I'm paranoid, so we track
-        # the iteration as well and sort the resulting p-value array based on that.
-        p_values = np.empty(n_voxels)
-        for voxel_idx in tqdm(range(n_voxels)):
-            p_values[voxel_idx] = self._scale_to_p_voxel(
-                voxel_idx, stat_values[voxel_idx], scale_values[:, voxel_idx]
-            )[0]
-
+        # calculate z-values
         z_values = p_to_z(p_values, tail="one")
         return p_values, z_values
