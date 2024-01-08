@@ -9,6 +9,8 @@ This package is a GPU wrapper for NiMARE that can run ALE (and MA maps) calculat
 
 ## Example
 ```python
+import os
+import numpy as np
 from nimare_gpu.ale import DeviceALE
 from nimare.correct import FWECorrector
 from nimare.dataset import Dataset
@@ -20,6 +22,9 @@ from nilearn.plotting import plot_stat_map
 dset_dir = download_nidm_pain()
 dset_file = os.path.join(get_resource_path(), "nidm_pain_dset.json")
 dset = Dataset(dset_file, target="mni152_2mm", mask=None)
+
+# set random seed
+np.random.seed(0)
 
 # run ALE
 meta = DeviceALE()
@@ -38,4 +43,4 @@ plot_stat_map(
     threshold=0.1,
 )
 ```
-![result plot](image.png)
+![result](image.png)

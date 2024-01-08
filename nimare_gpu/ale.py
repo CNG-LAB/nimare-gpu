@@ -172,6 +172,23 @@ class DeviceMixin:
     # TODO: add user option to change this, currently only can changed
     # after object is created via .sigma_scale
     sigma_scale = 1.0 
+    # set precision to single precision by default
+    # this can be changed by calling .set_dtype(bits)
+    d_float = cupy.float32
+    c_float = np.float32
+    def set_dtype(self, bits):
+        """
+        Set precision of floating point numbers to bits.
+        """
+        if bits == 32:
+            self.d_float = cupy.float32
+            self.c_float = np.float32
+        elif bits == 64:
+            self.d_float = cupy.float64
+            self.c_float = np.float64
+        else:
+            raise ValueError("bits must be 32 or 64.")
+
     def _set_kernels_gpu(self):
         """
         Precalculates ALE kernels for each experiment and copies them to GPU.
@@ -232,7 +249,7 @@ class DeviceMixin:
             self.kernels.append(kernel)
 
         # convert to array and copy to GPU
-        self.d_kernels = cupy.asarray(np.array(self.kernels), dtype=cupy.float32)
+        self.d_kernels = cupy.asarray(np.array(self.kernels), dtype=self.d_float)
 
         # set mid index of the kernels
         self.mid = int(np.floor(self.kernels[0].shape[0] / 2.0))
@@ -328,7 +345,7 @@ class DeviceALE(DeviceMixin, ALE):
         self._prepare_mask_gpu()
 
         # allocated memory for MA maps on GPU
-        d_ma_values = cupy.zeros((1, self.n_exp, self.n_voxels_in_mask), dtype=cupy.float32)
+        d_ma_values = cupy.zeros((1, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
         # copy ijks to GPU
         d_ijks = cupy.asarray(
             self.inputs_["coordinates"][["i", "j", "k"]].values[np.newaxis, :, :], # add a new axis for the single (true) permutation
@@ -510,13 +527,17 @@ class DeviceALE(DeviceMixin, ALE):
             # Identify summary statistic corresponding to intensity threshold
             ss_thresh = self._p_to_summarystat(voxel_thresh)
 
+
+            # Generate random coordinates of all permutations and foci
+            # in ijk space
             rand_idx = np.random.choice(
                 null_xyz.shape[0],
-                size=(self.inputs_["coordinates"].shape[0] * n_iters),
+                size=(self.inputs_["coordinates"].shape[0], n_iters),
             )
             rand_xyz = null_xyz[rand_idx, :]
-            rand_ijk = mm2vox(rand_xyz, self.masker.mask_img.affine)
-            iter_ijks = rand_ijk.reshape(n_iters, -1, 3)
+            iter_xyzs = np.split(rand_xyz, rand_xyz.shape[1], axis=1)
+            iter_ijks = mm2vox(np.array(iter_xyzs), self.masker.mask_img.affine).squeeze()
+            
 
             # Define connectivity matrix for cluster labeling
             conn = ndimage.generate_binary_structure(rank=3, connectivity=1)
@@ -524,10 +545,10 @@ class DeviceALE(DeviceMixin, ALE):
             # initialize ALE maps of batch on CPU
             # (only including voxels in mask)
             # this will be overwritten in each batch
-            ale_tmp = np.ones((n_iters, self.n_voxels_in_mask), dtype=np.float32)
+            ale_tmp = np.ones((n_iters, self.n_voxels_in_mask), dtype=self.c_float)
             # allocated memory for MA maps of each batch permutations on GPU
             # this will be overwritten in each batch
-            d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=cupy.float32)
+            d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
 
             fwe_voxel_max = np.zeros(n_iters)
             fwe_cluster_size_max = np.zeros(n_iters)
@@ -731,7 +752,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
         # Calculate true MA maps and ALE map
 
         # allocated memory for MA maps on GPU
-        d_ma_values = cupy.zeros((1, self.n_exp, self.n_voxels_in_mask), dtype=cupy.float32)
+        d_ma_values = cupy.zeros((1, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
         # copy ijks to GPU
         d_ijks = cupy.asarray(
             self.inputs_["coordinates"][["i", "j", "k"]].values[np.newaxis, :, :], # add a new axis for the single (true) permutation
@@ -795,25 +816,25 @@ class DeviceSCALE(DeviceMixin, SCALE):
         # sample random coordinates from self.xyz and 
         # transform them to ijk space
         rand_idx = np.random.choice(
-            self.xyz.shape[0], 
-            size=(self.inputs_["coordinates"].shape[0] * self.n_iters),
+            self.xyz.shape[0],
+            size=(self.inputs_["coordinates"].shape[0], self.n_iters),
         )
         rand_xyz = self.xyz[rand_idx, :]
-        rand_ijk = mm2vox(rand_xyz, self.masker.mask_img.affine)
-        iter_ijks = rand_ijk.reshape(self.n_iters, -1, 3)
+        iter_xyzs = np.split(rand_xyz, rand_xyz.shape[1], axis=1)
+        iter_ijks = mm2vox(np.array(iter_xyzs), self.masker.mask_img.affine).squeeze()
 
         # initialize ALE maps of batch on CPU
         # in the memmap file
         # (only including voxels in mask)
         perm_scale_values = np.memmap(
             self.memmap_filenames[1],
-            dtype=np.float32,
+            dtype=self.c_float,
             mode="w+",
             shape=(self.n_iters, self.n_voxels_in_mask),
         )
         # allocated memory for MA maps of each batch permutations on GPU
         # this will be overwritten in each batch
-        d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=cupy.float32)
+        d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
 
         # Run permutations on GPU
         n_batches = int(np.ceil(self.n_iters / batch_size))
@@ -957,7 +978,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
             voxel_hists[:curr_batch_size, 0] = cupy.asarray(n_zeros[vox_start:vox_end], dtype=cupy.int32)
             # copy permutation ALE values of this batch to GPU
             # and reshape it to (n_vox, n_perm)
-            voxel_nulls = cupy.asarray(scale_values[:, vox_start:vox_end].T, dtype=cupy.float32)
+            voxel_nulls = cupy.asarray(scale_values[:, vox_start:vox_end].T, dtype=self.d_float)
             # call the historgram calculation kernel on GPU
             # with rows (voxels) distributed across grid.x
             # and observations (permutations) distributed across
