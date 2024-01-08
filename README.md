@@ -1,6 +1,6 @@
 # GPU wrapper for NiMARE
 
-This package is a GPU wrapper for NiMARE that can run ALE (and MA maps) calculations more efficiently on GPUs. Currently only ALE and SCALE are implemented. The calculations are parallelized across experiments and the foci, with the option to also parallelize across batches of permutations. GPU parallelization is most beneficial in running many ALE permutations, e.g. in Monte Carlo Family-Wise Error multiple comparisons correction of ALE or the permutations of SCALE. It is particularly useful in large-scale meta-analyses with many experiments and foci and can lead to speed-up of +500x in comparison to a single CPU, but the speedup is quite smaller for small-scale meta-analyses.
+This package is a GPU wrapper for NiMARE that can run ALE (and MA maps) calculations more efficiently on GPUs. Currently only ALE and SCALE are implemented. The calculations are parallelized across experiments and the foci, with the option to also parallelize across batches of permutations. GPU parallelization is most beneficial in running many ALE permutations, e.g. in Monte Carlo Family-Wise Error multiple comparisons correction of ALE or the permutations of SCALE.
 
 ## Installation
 1. Install the correct version of CuPy according to the version of Nvidia Toolkit installed on your machine. [See CuPy's installation guide](https://docs.cupy.dev/en/stable/install.html#installing-cupy).

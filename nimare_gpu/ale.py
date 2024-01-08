@@ -15,7 +15,7 @@ from numba import cuda
 from nimare.meta.cbma.ale import ALE, SCALE
 from nimare.meta.utils import _calculate_cluster_measures
 from nimare.stats import null_to_p
-from nimare_gpu.stats import nullhist_to_p  # includes an option to skip checking min p-value
+from nimare_gpu.stats import nullhist_to_p 
 
 from numpy.lib.histograms import _get_bin_edges
 
@@ -278,10 +278,13 @@ class DeviceMixin:
         self.n_exp = len(exp_idx_uniq)
         # set max number of peaks (used to determine number of threads)
         self.max_peaks = max(exp_lens)
-        if self.max_peaks > 600:
-            LGR.warning(
-                "Number of peaks in at least one experiment is more than 600. "
-                "The GPU kernel might fail due to memory limitations."
+        if self.max_peaks > cupy.cuda.runtime.getDeviceProperties(0)['maxThreadsPerBlock']:
+            # TODO: break down the foci into multiple blocks if this happens
+            raise NotImplementedError(
+                "Number of peaks in at least one experiment is higher "
+                "than the number of threads per block, which is "
+                f"{cupy.cuda.runtime.getDeviceProperties(0)['maxThreadsPerBlock']}. "
+                "Please remove these experiments and rerun."
             )
 
     def _prepare_mask_gpu(self):
@@ -536,7 +539,7 @@ class DeviceALE(DeviceMixin, ALE):
             )
             rand_xyz = null_xyz[rand_idx, :]
             iter_xyzs = np.split(rand_xyz, rand_xyz.shape[1], axis=1)
-            iter_ijks = mm2vox(np.array(iter_xyzs), self.masker.mask_img.affine).squeeze()
+            iter_ijks = mm2vox(np.array(iter_xyzs), self.masker.mask_img.affine).squeeze(axis=2)
             
 
             # Define connectivity matrix for cluster labeling
@@ -821,7 +824,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
         )
         rand_xyz = self.xyz[rand_idx, :]
         iter_xyzs = np.split(rand_xyz, rand_xyz.shape[1], axis=1)
-        iter_ijks = mm2vox(np.array(iter_xyzs), self.masker.mask_img.affine).squeeze()
+        iter_ijks = mm2vox(np.array(iter_xyzs), self.masker.mask_img.affine).squeeze(axis=2)
 
         # initialize ALE maps of batch on CPU
         # in the memmap file
@@ -968,6 +971,8 @@ class DeviceSCALE(DeviceMixin, SCALE):
         p_values = np.zeros(n_vox)
         # get mempool for GPU memory management
         mempool = cupy.get_default_memory_pool() 
+        # keep track of smallest possible p-value across batches
+        smallest_value = np.inf
         for i_batch in tqdm(range(n_batches)):
             # reset histograms to all 0s
             voxel_hists.fill(0)
@@ -995,17 +1000,20 @@ class DeviceSCALE(DeviceMixin, SCALE):
             # p-value to smallest value of null distribution
             # as null distribution and its smallest value is
             # different in each batch of voxels
-            p_values[vox_start:vox_end] = nullhist_to_p(
+            p_values[vox_start:vox_end], batch_smallest_value = nullhist_to_p(
                 stat_values[vox_start:vox_end],
                 voxel_hists_[:curr_batch_size,:].T,
                 self.null_distributions_["histogram_bins"],
-                min_check=False
+                is_batch=True
             )
+            if batch_smallest_value < smallest_value:
+                smallest_value = batch_smallest_value
             # all_voxel_hists[vox_start:vox_end, :] = voxel_hists_[:curr_batch_size, :] # uncomment to keep all hists
             # free GPU memory
             del voxel_nulls
             mempool.free_all_blocks()
-
+        # set the min p-value to smallest value of null distribution
+        p_values = np.maximum(p_values, smallest_value)
         # calculate z-values
         z_values = p_to_z(p_values, tail="one")
         return p_values, z_values
