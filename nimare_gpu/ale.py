@@ -10,6 +10,7 @@ import sparse
 
 import cupy
 from cupyx import jit
+from numba import cuda
 
 from nimare.meta.cbma.ale import ALE, SCALE
 from nimare.meta.utils import _calculate_cluster_measures
@@ -27,7 +28,7 @@ from nimare_gpu.utils import get_ale_kernel
 
 LGR = logging.getLogger(__name__)
 
-@jit.rawkernel()
+@cuda.jit()
 def compute_ma_gpu(
         ma_maps, ijks,
         kernels, exp_starts, exp_lens,
@@ -61,9 +62,9 @@ def compute_ma_gpu(
         as kernel size is fixed these should be precalculated on cpu
         to avoid repeated calculation in the gpu
     """
-    i_perm = jit.blockIdx.x # index of permutation in ma_maps
-    i_exp = jit.blockIdx.y # index of experiment
-    i_peak = jit.threadIdx.x # index of peak coordinate within current experiment
+    i_perm = cuda.blockIdx.x # index of permutation in ma_maps
+    i_exp = cuda.blockIdx.y # index of experiment
+    i_peak = cuda.threadIdx.x # index of peak coordinate within current experiment
     
     # only run if i_peak is a valid index
     if i_peak < exp_lens[i_exp]: 
@@ -109,15 +110,17 @@ def compute_ma_gpu(
                         # `vox` is the index of voxel in mask
                         vox = mask_idx_mapping[xl+xi, yl+yi, zl+zi]
                         if vox!=-1: 
-                            ma_maps[i_perm, i_exp, vox] = max(
-                                ma_maps[i_perm, i_exp, vox], kernels[i_exp, xlk+xi, ylk+yi, zlk+zi]
-                            ) 
-
+                            # using atomic max to prevent
+                            # memory race (though is unlikely)
+                            cuda.atomic.max(ma_maps, (0, i_exp, vox), kernels[i_exp, xlk+xi, ylk+yi, zlk+zi])
 
 class DeviceMixin:
     """
     Mixin class for GPU-enabled estimators.
     """
+    # TODO: add user option to change this, currently only can changed
+    # after object is created via .sigma_scale
+    sigma_scale = 1.0 
     def _set_kernels_gpu(self):
         """
         Precalculates ALE kernels for each experiment and copies them to GPU.
@@ -138,13 +141,13 @@ class DeviceMixin:
             sample_sizes = None
         if self.kernel_transformer.fwhm is not None:
             assert np.isfinite(self.kernel_transformer.fwhm), "FWHM must be finite number"
-            _, kernel = get_ale_kernel(mask, fwhm=self.kernel_transformer.fwhm)
+            _, kernel = get_ale_kernel(mask, fwhm=self.kernel_transformer.fwhm, sigma_scale=self.sigma_scale)
             use_dict = False
 
         # from utils.compute_ale_ma
         if use_dict:
             if kernel is not None:
-                warnings.warn("The kernel provided will be replace by an empty dictionary.")
+                LGR.warn("The kernel provided will be replace by an empty dictionary.")
             kernels = {}  # retain kernels in dictionary to speed things up
             if not isinstance(sample_sizes, np.ndarray):
                 raise ValueError("To use a kernel dictionary sample_sizes must be a list.")
@@ -169,12 +172,12 @@ class DeviceMixin:
                 # Get sample_size from input
                 sample_size = sample_sizes[curr_exp_idx][0]
                 if sample_size not in kernels.keys():
-                    _, kernel = get_ale_kernel(mask, sample_size=sample_size)
+                    _, kernel = get_ale_kernel(mask, sample_size=sample_size, sigma_scale=self.sigma_scale)
                     kernels[sample_size] = kernel
                 else:
                     kernel = kernels[sample_size]
             elif sample_sizes is not None:
-                _, kernel = get_ale_kernel(mask, sample_size=sample_sizes)
+                _, kernel = get_ale_kernel(mask, sample_size=sample_sizes, sigma_scale=self.sigma_scale)
             self.kernels.append(kernel)
 
         # convert to array and copy to GPU
@@ -230,7 +233,7 @@ class DeviceMixin:
         self.d_mask_idx_mapping = cupy.asarray(mask_idx_mapping, dtype=cupy.int32)
 
 class DeviceALE(DeviceMixin, ALE):
-    def _fit(self, dataset, use_cpu=True):
+    def _fit(self, dataset, use_cpu=False):
         """Perform coordinate-based meta-analysis on dataset.
 
         Parameters
@@ -242,8 +245,14 @@ class DeviceALE(DeviceMixin, ALE):
             because the benefit of GPU parallelization is more clear
             in running a large number of ALEs (e.g. in permutations of
             Monte Carlo FWE correction) than in running a single ALE.
+        sigma_scale : :obj:`float`, optional
+            Scaling factor for kernel sigma. Default is 1.0.
         """
         if use_cpu:
+            if self.sigma_scale != 1.0:
+                LGR.warn(
+                    "sigma_scale is not used when use_cpu is True."
+                )
             return super()._fit(dataset)
         # this code is copied from nimare.meta.cbma.base.CBMAEstimator._fit
         # from version 0.2.0 and is modified to run on GPU
@@ -274,16 +283,15 @@ class DeviceALE(DeviceMixin, ALE):
             self.inputs_["coordinates"][["i", "j", "k"]].values[np.newaxis, :, :], # add a new axis for the single (true) permutation
             dtype=cupy.int32)
 
-        compute_ma_gpu(
+        compute_ma_gpu[
             (1, self.n_exp),
-            (self.max_peaks,),
-            (
-                d_ma_values, d_ijks,
-                self.d_kernels, self.d_exp_starts, self.d_exp_lens,
-                self.d_mask_idx_mapping,
-                self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
-                self.mid, self.mid+1
-            )
+            (self.max_peaks,)
+        ](
+            d_ma_values, d_ijks,
+            self.d_kernels, self.d_exp_starts, self.d_exp_lens,
+            self.d_mask_idx_mapping,
+            self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
+            self.mid, self.mid+1
         )
         # copy MA maps to CPU
         ma_values = d_ma_values.get().squeeze()
@@ -483,16 +491,15 @@ class DeviceALE(DeviceMixin, ALE):
                 d_batch_ijks = cupy.asarray(iter_ijks[batch_start:batch_end], dtype=cupy.int32)
                 # initialze ma maps as zeros
                 d_ma_tmp[:, :, :] = 0
-                compute_ma_gpu(
+                compute_ma_gpu[
                     (batch_n_iters, self.n_exp),
-                    (self.max_peaks,),
-                    (
-                        d_ma_tmp, d_batch_ijks,
-                        self.d_kernels, self.d_exp_starts, self.d_exp_lens,
-                        self.d_mask_idx_mapping,
-                        self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
-                        self.mid, self.mid+1
-                    )
+                    (self.max_peaks,)
+                ](
+                    d_ma_tmp, d_batch_ijks,
+                    self.d_kernels, self.d_exp_starts, self.d_exp_lens,
+                    self.d_mask_idx_mapping,
+                    self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
+                    self.mid, self.mid+1
                 )
                 # calculate ALE 
                 # reuse the same array in each batch to save memory
@@ -634,6 +641,7 @@ class DeviceALE(DeviceMixin, ALE):
     
 
 class DeviceSCALE(DeviceMixin, SCALE):
+    keep_perm_nulls = False # TODO: add user option to change this
     @use_memmap(LGR, n_files=2)
     def _fit(self, dataset, batch_size=1, calculate_z_std=True):
         """Perform specific coactivation likelihood estimation meta-analysis on dataset
@@ -677,16 +685,15 @@ class DeviceSCALE(DeviceMixin, SCALE):
             self.inputs_["coordinates"][["i", "j", "k"]].values[np.newaxis, :, :], # add a new axis for the single (true) permutation
             dtype=cupy.int32)
 
-        compute_ma_gpu(
+        compute_ma_gpu[
             (1, self.n_exp),
-            (self.max_peaks,),
-            (
-                d_ma_values, d_ijks,
-                self.d_kernels, self.d_exp_starts, self.d_exp_lens,
-                self.d_mask_idx_mapping,
-                self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
-                self.mid, self.mid+1
-            )
+            (self.max_peaks,)
+        ](
+            d_ma_values, d_ijks,
+            self.d_kernels, self.d_exp_starts, self.d_exp_lens,
+            self.d_mask_idx_mapping,
+            self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
+            self.mid, self.mid+1
         )
         # copy MA maps to CPU
         # save ALE and MA as attributes for debugging
@@ -765,17 +772,16 @@ class DeviceSCALE(DeviceMixin, SCALE):
             d_batch_ijks = cupy.asarray(iter_ijks[batch_start:batch_end], dtype=cupy.int32)
             # initialze ma maps as zeros
             d_ma_tmp[:, :, :] = 0
-            compute_ma_gpu(
-                (batch_n_iters, self.n_exp),
-                (self.max_peaks,),
-                (
+            compute_ma_gpu[
+                        (batch_n_iters, self.n_exp),
+                        (self.max_peaks,)
+                ](
                     d_ma_tmp, d_batch_ijks,
                     self.d_kernels, self.d_exp_starts, self.d_exp_lens,
                     self.d_mask_idx_mapping,
                     self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
                     self.mid, self.mid+1
                 )
-            )
             # calculate ALE 
             # reuse the same array in each batch to save memory
             perm_scale_values[batch_start:batch_end, :] = \
@@ -792,11 +798,13 @@ class DeviceSCALE(DeviceMixin, SCALE):
             # calculate Z scores based on true-mean(null)/std(null)
             z_values_std = self._scale_to_z(self.stat_values, perm_scale_values)
 
-        if isinstance(perm_scale_values, np.memmap):
-            LGR.debug(f"Closing memmap at {perm_scale_values.filename}")
-            perm_scale_values._mmap.close()
-
-        del perm_scale_values
+        if self.keep_perm_nulls:
+            self.null_distributions_["perm_scale_values"] = perm_scale_values
+        else:
+            if isinstance(perm_scale_values, np.memmap):
+                LGR.debug(f"Closing memmap at {perm_scale_values.filename}")
+                perm_scale_values._mmap.close()
+            del perm_scale_values
 
         logp_values = -np.log10(p_values)
         logp_values[np.isinf(logp_values)] = -np.log10(np.finfo(float).eps)
@@ -817,3 +825,37 @@ class DeviceSCALE(DeviceMixin, SCALE):
             ) / np.std(perm_scale_values, axis=0, keepdims=True)
         )
         return z_values
+
+    def _scale_to_p(self, stat_values, scale_values):
+        # added this temporarily to show tqdm for troubleshooting
+        """Compute p- and z-values.
+
+        Parameters
+        ----------
+        stat_values : (V) array
+            ALE values.
+        scale_values : (I x V) array
+            Permutation ALE values.
+
+        Returns
+        -------
+        p_values : (V) array
+        z_values : (V) array
+
+        Notes
+        -----
+        This method also uses the "histogram_bins" element in the null_distributions_ attribute.
+        """
+        from nimare.transforms import p_to_z
+        n_voxels = stat_values.shape[0]
+
+        # I know that joblib probably preserves order of outputs, but I'm paranoid, so we track
+        # the iteration as well and sort the resulting p-value array based on that.
+        p_values = np.empty(n_voxels)
+        for voxel_idx in tqdm(range(n_voxels)):
+            p_values[voxel_idx] = self._scale_to_p_voxel(
+                voxel_idx, stat_values[voxel_idx], scale_values[:, voxel_idx]
+            )[0]
+
+        z_values = p_to_z(p_values, tail="one")
+        return p_values, z_values

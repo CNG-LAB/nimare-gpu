@@ -2,10 +2,29 @@ import numpy as np
 from scipy import ndimage
 
 
-def get_ale_kernel(img, sample_size=None, fwhm=None):
+def get_ale_kernel(img, sample_size=None, fwhm=None, sigma_scale=1.0):
     # copied from nimare.meta.utils.get_ale_kernel
     # and removed kernel cropping
-    """Estimate 3D Gaussian and sigma (in voxels) for ALE kernel given sample size or fwhm."""
+    """Estimate 3D Gaussian and sigma (in voxels) for ALE kernel given sample size or fwhm.
+    
+    Parameters
+    ----------
+    img : :obj:`nibabel.Nifti1Image`
+        Image to use as a template for the kernel.
+    sample_size : :obj:`int`, optional
+        Sample size. If specified, FWHM will be estimated from sample size.
+    fwhm : :obj:`float`, optional
+        Full-width half-max for Gaussian kernel in mm.
+    sigma_scale : :obj:`float`, optional
+        Scaling factor for sigma. Default is 1.0.
+
+    Returns
+    -------
+    sigma_vox : :obj:`float`
+        Sigma of Gaussian kernel in voxels.
+    kernel : array_like
+        3D Gaussian kernel. 
+    """
     if sample_size is not None and fwhm is not None:
         raise ValueError('Only one of "sample_size" and "fwhm" may be specified')
     elif sample_size is None and fwhm is None:
@@ -24,6 +43,7 @@ def get_ale_kernel(img, sample_size=None, fwhm=None):
     sigma_vox = (
         fwhm_vox * np.sqrt(2.0) / (np.sqrt(2.0 * np.log(2.0)) * 2.0)
     )  # pylint: disable=no-member
+    sigma_vox *= sigma_scale
 
     data = np.zeros((31, 31, 31))
     mid = int(np.floor(data.shape[0] / 2.0))
