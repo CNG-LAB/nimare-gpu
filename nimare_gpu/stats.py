@@ -77,6 +77,7 @@ def nullhist_to_p(test_values, histogram_weights, histogram_bins, is_batch=False
 
     # ensure p_value in the following range:
     # smallest_value <= p_value <= 1.0
+    # only if not part of a batch
     p_values = np.minimum(p_values, 1.0)
     if not is_batch:
         p_values = np.maximum(smallest_value, p_values)

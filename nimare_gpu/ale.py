@@ -718,6 +718,7 @@ class DeviceALE(DeviceMixin, ALE):
 class DeviceSCALE(DeviceMixin, SCALE):
     keep_perm_nulls = False # TODO: add user option to change this
     use_cpu = False # for debugging/testing TODO: add user option to change this
+    use_mmap = True
     @use_memmap(LGR, n_files=2)
     def _fit(self, dataset, batch_size=1, calculate_z_std=True):
         """Perform specific coactivation likelihood estimation meta-analysis on dataset
@@ -827,14 +828,18 @@ class DeviceSCALE(DeviceMixin, SCALE):
         iter_ijks = mm2vox(np.array(iter_xyzs), self.masker.mask_img.affine).squeeze(axis=2)
 
         # initialize ALE maps of batch on CPU
-        # in the memmap file
         # (only including voxels in mask)
-        perm_scale_values = np.memmap(
-            self.memmap_filenames[1],
-            dtype=self.c_float,
-            mode="w+",
-            shape=(self.n_iters, self.n_voxels_in_mask),
-        )
+        if self.use_mmap:
+            # in memmap file
+            perm_scale_values = np.memmap(
+                self.memmap_filenames[1],
+                dtype=self.c_float,
+                mode="w+",
+                shape=(self.n_iters, self.n_voxels_in_mask),
+            )
+        else:
+            # in RAM
+            perm_scale_values = np.zeros((self.n_iters, self.n_voxels_in_mask), dtype=self.c_float)
         # allocated memory for MA maps of each batch permutations on GPU
         # this will be overwritten in each batch
         d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
