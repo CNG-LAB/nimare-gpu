@@ -1,25 +1,12 @@
-import warnings
 import logging
 import nibabel as nib
 import numpy as np
 from scipy import ndimage
 from tqdm.auto import tqdm
-from nilearn.input_data import NiftiMasker
 import sparse
 
-
-import cupy
-from cupyx import jit
-from numba import cuda
-
 from nimare.meta.cbma.ale import ALE, SCALE
-from nimare.meta.utils import _calculate_cluster_measures
 from nimare.stats import null_to_p
-from nimare_gpu.stats import nullhist_to_p 
-
-from numpy.lib.histograms import _get_bin_edges
-
-
 from nimare.transforms import p_to_z
 from nimare.utils import (
     _check_ncores,
@@ -27,9 +14,15 @@ from nimare.utils import (
     vox2mm,
     use_memmap
 )
+from nilearn.input_data import NiftiMasker
 
-from nimare_gpu.utils import get_ale_kernel
+import cupy
+from numba import cuda
+from cupyx.scipy import ndimage as cupy_ndimage
+from numpy.lib.histograms import _get_bin_edges
 
+from nimare_gpu.stats import nullhist_to_p 
+from nimare_gpu.utils import get_ale_kernel, _calculate_cluster_measures
 
 LGR = logging.getLogger(__name__)
 
@@ -176,6 +169,7 @@ class DeviceMixin:
     # this can be changed by calling .set_dtype(bits)
     d_float = cupy.float32
     c_float = np.float32
+    
     def set_dtype(self, bits):
         """
         Set precision of floating point numbers to bits.
@@ -298,10 +292,15 @@ class DeviceMixin:
         self._ALE__n_mask_voxels = self.n_voxels_in_mask # this name is used in nimare
         # create a mapping from xyz coordinates to voxel index in mask
         # or -1 if voxel is outside mask
-        mask_idx_mapping = np.ones(self.masker.mask_img.shape, dtype=int)*-1
+        # setting the non-mask voxels to -1 serves two purposes:
+        # 1. In GPU kernel it is used to identify voxels that are not in mask (and skipped in the loop)
+        # 2. In FWE permutation code, in ALE 1D->3D mapping, it points to the last element
+        # of the 1D array, which is a np.NaN appended to the end of 1D ALE array on the fly, 
+        # and so it makes the background all NaN.
+        self.mask_idx_mapping = np.ones(self.masker.mask_img.shape, dtype=int)*-1
         for i in range(self.in_mask_voxels.shape[0]):
-            mask_idx_mapping[self.in_mask_voxels[i,0], self.in_mask_voxels[i,1], self.in_mask_voxels[i,2]] = i
-        self.d_mask_idx_mapping = cupy.asarray(mask_idx_mapping, dtype=cupy.int32)
+            self.mask_idx_mapping[self.in_mask_voxels[i,0], self.in_mask_voxels[i,1], self.in_mask_voxels[i,2]] = i
+        self.d_mask_idx_mapping = cupy.asarray(self.mask_idx_mapping, dtype=cupy.int32) # the GPU copy
 
 class DeviceALE(DeviceMixin, ALE):
     def _fit(self, dataset, use_cpu=False):
@@ -543,7 +542,8 @@ class DeviceALE(DeviceMixin, ALE):
             
 
             # Define connectivity matrix for cluster labeling
-            conn = ndimage.generate_binary_structure(rank=3, connectivity=1)
+            d_conn = cupy_ndimage.generate_binary_structure(rank=3, connectivity=1) # used in the loop
+            conn = ndimage.generate_binary_structure(rank=3, connectivity=1) # used at the end
 
             # initialize ALE maps of batch on CPU
             # (only including voxels in mask)
@@ -592,9 +592,14 @@ class DeviceALE(DeviceMixin, ALE):
                         fwe_cluster_size_max[i_iter+batch_start], fwe_cluster_mass_max[i_iter+batch_start] = None, None
                     else:
                         # Cluster-level inference
-                        iter_ale_map = self.masker.inverse_transform(iter_ale_map).get_fdata()
+                        # convert 1D in-mask ALE array to 3D image data
+                        # instead of using the slow self.masker.inverse_transform
+                        # using much faster numpy indexing
+                        # here we append a NaN at the end of 1D ALE to fill background (index -1) with NaNs
+                        iter_ale_map = np.append(iter_ale_map, np.NaN)[self.mask_idx_mapping]
+                        # get cluster measures
                         fwe_cluster_size_max[i_iter+batch_start], fwe_cluster_mass_max[i_iter+batch_start] = _calculate_cluster_measures(
-                            iter_ale_map, ss_thresh, conn, tail="upper"
+                            iter_ale_map, ss_thresh, d_conn, tail="upper"
                         )
             # Free some GPU memory
             del d_batch_ijks, d_ma_tmp
@@ -949,7 +954,9 @@ class DeviceSCALE(DeviceMixin, SCALE):
         ## make sure n_elements_per_block is not > n_perm
         n_elements_per_block = min(n_elements_per_block, n_perm)
         n_blocks_per_perm = int(np.ceil(n_perm / n_elements_per_block))
-        # set 0s to -1; not using NaN because
+        # set 0s to -1 to skip them in histogram calculations
+        # (number of zeros are calculated separately below)
+        # I am using -1 instead of NaN because
         # not sure if NaNs can be handled consistently
         # on GPU, i.e., np.NaN float value might be different
         # and I wouldn't trust it to do a value == np.NaN check

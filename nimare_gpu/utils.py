@@ -1,5 +1,7 @@
 import numpy as np
 from scipy import ndimage
+import cupy
+from cupyx.scipy import ndimage as cupy_ndimage
 
 
 def get_ale_kernel(img, sample_size=None, fwhm=None, sigma_scale=1.0):
@@ -50,3 +52,60 @@ def get_ale_kernel(img, sample_size=None, fwhm=None, sigma_scale=1.0):
     data[mid, mid, mid] = 1.0
     kernel = ndimage.gaussian_filter(data, sigma_vox, mode="constant")
     return sigma_vox, kernel
+
+def _calculate_cluster_measures(arr3d, threshold, conn, tail="upper"):
+    """Calculate maximum cluster mass and size for an array using GPU.
+
+    This method assesses both positive and negative clusters.
+
+    Parameters
+    ----------
+    arr3d : :obj:`numpy.ndarray`
+        Unthresholded 3D summary-statistic matrix. This matrix will end up changed in place.
+    threshold : :obj:`float`
+        Uncorrected summary-statistic thresholded for defining clusters.
+    conn : :obj:`numpy.ndarray` of shape (3, 3, 3)
+        Connectivity matrix for defining clusters.
+
+    Returns
+    -------
+    max_size, max_mass : :obj:`float`
+        Maximum cluster size and mass from the matrix.
+    """
+    if tail == "upper":
+        arr3d[arr3d <= threshold] = 0
+    else:
+        arr3d[np.abs(arr3d) <= threshold] = 0
+    
+    arr3d = cupy.asarray(arr3d)
+
+    # labeled_arr3d = np.empty(arr3d.shape, int)
+    labeled_arr3d, _ = cupy_ndimage.label(arr3d>0, conn)
+
+    if tail == "two":
+        # Label positive and negative clusters separately
+        n_positive_clusters = cupy.max(labeled_arr3d)
+        temp_labeled_arr3d, _ = cupy_ndimage.label(arr3d < 0, conn)
+        temp_labeled_arr3d[temp_labeled_arr3d > 0] += n_positive_clusters
+        labeled_arr3d = labeled_arr3d + temp_labeled_arr3d
+        del temp_labeled_arr3d
+
+    clust_sizes = cupy.bincount(labeled_arr3d.flatten())
+    clust_vals = cupy.arange(0, clust_sizes.shape[0])
+
+    # Cluster mass-based inference
+    max_mass = 0
+    for unique_val in clust_vals[1:]:
+        ss_vals = cupy.abs(arr3d[labeled_arr3d == unique_val]) - threshold
+        max_mass = cupy.maximum(max_mass, cupy.sum(ss_vals))
+
+    # Cluster size-based inference
+    clust_sizes = clust_sizes[1:]  # First cluster is zeros in matrix
+    if clust_sizes.size:
+        max_size = cupy.max(clust_sizes)
+    else:
+        max_size = 0
+
+    del arr3d, labeled_arr3d, clust_sizes, clust_vals
+
+    return max_size, max_mass
