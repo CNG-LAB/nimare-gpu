@@ -169,7 +169,7 @@ class DeviceMixin:
     # this can be changed by calling .set_dtype(bits)
     d_float = cupy.float32
     c_float = np.float32
-    
+
     def set_dtype(self, bits):
         """
         Set precision of floating point numbers to bits.
@@ -415,6 +415,7 @@ class DeviceALE(DeviceMixin, ALE):
         n_cores=1,
         batch_size=1,
         vfwe_only=False,
+        keep_null_ales=False,
     ):
         # most of this code is copied from nimare.cbma.base.Base.correct_fwe_montecarlo
         # from version 0.2.0 and is modified to run on GPU
@@ -447,6 +448,9 @@ class DeviceALE(DeviceMixin, ALE):
         vfwe_only : :obj:`bool`, optional
             If True, only calculate the voxel-level FWE-corrected maps. Voxel-level correction
             can be performed very quickly if the Estimator's ``null_method`` was "montecarlo".
+            Default is False.
+        keep_null_ales : :obj:`bool`, optional
+            Keeps the null ALE maps in the ``null_ales`` attribute for debugging.
             Default is False.
 
         Returns
@@ -548,10 +552,14 @@ class DeviceALE(DeviceMixin, ALE):
             # initialize ALE maps of batch on CPU
             # (only including voxels in mask)
             # this will be overwritten in each batch
-            ale_tmp = np.ones((n_iters, self.n_voxels_in_mask), dtype=self.c_float)
+            ale_tmp = np.ones((batch_size, self.n_voxels_in_mask), dtype=self.c_float)
             # allocated memory for MA maps of each batch permutations on GPU
             # this will be overwritten in each batch
             d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
+
+            if keep_null_ales:
+                self.null_distributions_['ale'] = np.ones((n_iters, self.n_voxels_in_mask), dtype=self.c_float)
+
 
             fwe_voxel_max = np.zeros(n_iters)
             fwe_cluster_size_max = np.zeros(n_iters)
@@ -576,15 +584,17 @@ class DeviceALE(DeviceMixin, ALE):
                     self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
                     self.mid, self.mid+1
                 )
-                # calculate ALE 
-                # reuse the same array in each batch to save memory
-                ale_tmp[batch_start:batch_end, :] = \
+                # calculate ALE of current batch
+                ale_tmp[:, :] = \
                     (1-cupy.prod((1 - d_ma_tmp), axis=1)).get()
+                
+                if keep_null_ales:
+                    self.null_distributions_['ale'][batch_start:batch_end, :] = ale_tmp
                 
                 # get fwe_voxel_max, fwe_cluster_size_max and fwe_cluster_mass_max
                 # for each permutation in batch
                 for i_iter in range(batch_n_iters):
-                    iter_ale_map = ale_tmp[i_iter+batch_start, :]
+                    iter_ale_map = ale_tmp[i_iter, :]
                     # Voxel-level inference
                     fwe_voxel_max[i_iter+batch_start] = np.max(iter_ale_map)
 
