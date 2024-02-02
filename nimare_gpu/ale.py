@@ -15,6 +15,7 @@ from nimare.utils import (
     use_memmap
 )
 from nilearn.input_data import NiftiMasker
+from nilearn.image import resample_to_img
 
 import cupy
 from numba import cuda
@@ -440,11 +441,11 @@ class DeviceALE(DeviceMixin, ALE):
             ** There must be one GPU device available to each CPU core. **
         batch_size: :obj:`int`, optional
             Number of permutations to run in each batch on GPU. Default is 1.
-            The batch size is limited by the GPU memory, as each set of MA maps
-            of each permutation uses up large amount of memory. Setting the batch_size
-            to 1 is the most efficient approach in most cases, as the real parallelization
-            occurs across experiments and foci. But on very powerful GPUs, increasing
-            batch_size may improve performance.
+            Generally a larger batch size is more efficient, but requires more
+            GPU memory. With larger number of experiments memory requirement
+            increases and the maximum possible batch size decreases.
+            For best performance, start with a higher batch size (e.g. 200)
+            and gradually decrease it until OutOfMemoryError is not raised.
         vfwe_only : :obj:`bool`, optional
             If True, only calculate the voxel-level FWE-corrected maps. Voxel-level correction
             can be performed very quickly if the Estimator's ``null_method`` was "montecarlo".
@@ -731,11 +732,104 @@ class DeviceALE(DeviceMixin, ALE):
     
 
 class DeviceSCALE(DeviceMixin, SCALE):
-    keep_perm_nulls = False # TODO: add user option to change this
-    use_cpu = False # for debugging/testing TODO: add user option to change this
-    use_mmap = True
+    def __init__(self,
+                 approach,
+                 prob_map=None,
+                 xyz=None,
+                 sigma_scale=1.0,
+                 keep_perm_nulls=False, 
+                 use_cpu=False, 
+                 batch_size=1,
+                 use_mmap=False, 
+                 nbits=64,
+                 **kwargs):
+        """
+        Specific (co)activation likelihood estimation on GPU.
+        It supports two types of sampling for the null coordinates:
+        - 'deterministic' (original approach): the null coordinates 
+          are sampled from provided xyz
+        - 'probabilistic': the null coordinates are sampled weighted
+          by a voxel-wise probability map, e.g. obtained from combining
+          kernels of all foci reported in BrainMap.
+
+        Parameters
+        ----------
+        approach : {'deterministic', 'probabilistic'}
+            Approach to use for sampling null coordinates.
+        xyz: :obj:`np.ndarray` or None
+            xyz coordinates of foci used in the deterministic approach.
+            If None, all the voxels within the mask are used. Set to None
+            in the probabilistic approach.
+        prob_map : :obj:`str`, :class:`~nibabel.nifti1.Nifti1Image`, or None
+            Voxel-wise probability map used in the probabilistic approach.
+            If None, assumes uniform probability. Set to None in the
+            deterministic approach. It is assumed to be a whole-brain
+            map, which will then be masked and normalized within the mask.
+        sigma_scale : :obj:`float`, optional
+            Scaling of the kernel sigma. Default is 1.0.
+        keep_perm_nulls : :obj:`bool`, optional
+            Whether to keep the null MA maps in the ``null_distributions_`` attribute.
+            Default is False.
+        use_cpu : :obj:`bool`, optional
+        batch_size: :obj:`int`, optional
+            Number of permutations to run in each batch on GPU. Default is 1.
+            Generally a larger batch size is more efficient, but requires more
+            GPU memory. With larger number of experiments memory requirement
+            increases and the maximum possible batch size decreases.
+            For best performance, start with a higher batch size (e.g. 200)
+            and gradually decrease it until OutOfMemoryError is not raised.
+        use_mmap: :obj:`bool`, optional
+            Whether to use memory-mapped arrays for the null MA maps.
+            Default is False. Note that it slows down the permutations
+            but can be useful if memory is limited.
+        nbits: {32, 64}, optional
+            Precision of floating point numbers. Default is 64.
+            32-bit precision is faster and uses less memory.
+        **kwargs
+            Keyword arguments passed to :class:`nimare.meta.cbma.ale.SCALE`,
+            including `n_iters` and `n_cores`.
+        """
+        # TODO: consider creating separate classes
+        # for the deterministic and probabilistic approaches
+        if xyz is None:
+            xyz = np.zeros((1, 3)) # nimare's SCALE expects xyz to be np.ndarray
+        super().__init__(xyz, **kwargs)
+        self.approach = approach
+        if isinstance(prob_map, str):
+            prob_map = nib.load(prob_map)
+        self.prob_map = prob_map
+        self.keep_perm_nulls = keep_perm_nulls
+        self.use_cpu = use_cpu
+        self.batch_size = batch_size
+        self.use_mmap = use_mmap
+        self.sigma_scale = sigma_scale
+        self.set_dtype(nbits)
+
+    def _prepare_null_sampling(self):
+        """Sets the xyz and sampling_prob attributes."""
+        if self.approach == 'probabilistic':
+            # resample prob_map to mask if needed
+            if not np.array_equal(
+                self.prob_map.affine, self.masker.mask_img.affine
+            ):
+                LGR.warn("prob_map and mask do not have the same affine..."
+                        "Resampling prob_map to mask affine.")
+                self.prob_map = resample_to_img(self.prob_map, self.masker.mask_img, 
+                                                interpolation='continuous')
+            # mask prob_map
+            self.sampling_prob = self.masker.transform(self.prob_map).squeeze()
+            # normalize prob_map to a sum probability of 1
+            self.sampling_prob /= self.sampling_prob.sum()
+            # set xyz to all voxels in mask
+            mask_ijks = np.array(np.where(self.masker.mask_img.get_fdata().astype(bool))).T
+            self.xyz = vox2mm(mask_ijks, self.masker.mask_img.affine)
+        elif self.approach == 'deterministic':
+            self.sampling_prob = None
+            if self.xyz is None:
+                raise ValueError("xyz must be provided in the deterministic approach.")
+            
     @use_memmap(LGR, n_files=2)
-    def _fit(self, dataset, batch_size=1, calculate_z_std=True):
+    def _fit(self, dataset):
         """Perform specific coactivation likelihood estimation meta-analysis on dataset
         on GPU.
 
@@ -743,17 +837,6 @@ class DeviceSCALE(DeviceMixin, SCALE):
         ----------
         dataset : :obj:`~nimare.dataset.Dataset`
             Dataset to analyze.
-        batch_size: :obj:`int`, optional
-            Number of permutations to run in each batch on GPU. Default is 1.
-            The batch size is limited by the GPU memory, as each set of MA maps
-            of each permutation uses up large amount of memory. Setting the batch_size
-            to 1 is the most efficient approach in most cases, as the real parallelization
-            occurs across experiments and foci. But on very powerful GPUs, increasing
-            batch_size may improve performance.
-        calculate_z_std : :obj:`bool`, optional
-            Whether to calculate the Z scores in each voxel based on 
-            true-mean(null)/std(null) as well as the Z scores based on
-            p-values
         """
         self.dataset = dataset
         self.masker = self.masker or dataset.masker
@@ -768,8 +851,11 @@ class DeviceSCALE(DeviceMixin, SCALE):
         self._set_exp_indexing_gpu()
         self._prepare_mask_gpu()
 
-        # Calculate true MA maps and ALE map
+        # prepare null sampling
+        # (set self.sampling_prob and self.xyz)
+        self._prepare_null_sampling()
 
+        # Calculate true MA maps and ALE map
         # allocated memory for MA maps on GPU
         d_ma_values = cupy.zeros((1, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
         # copy ijks to GPU
@@ -837,6 +923,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
         rand_idx = np.random.choice(
             self.xyz.shape[0],
             size=(self.inputs_["coordinates"].shape[0], self.n_iters),
+            p=self.sampling_prob
         )
         rand_xyz = self.xyz[rand_idx, :]
         iter_xyzs = np.split(rand_xyz, rand_xyz.shape[1], axis=1)
@@ -857,13 +944,13 @@ class DeviceSCALE(DeviceMixin, SCALE):
             perm_scale_values = np.zeros((self.n_iters, self.n_voxels_in_mask), dtype=self.c_float)
         # allocated memory for MA maps of each batch permutations on GPU
         # this will be overwritten in each batch
-        d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
+        d_ma_tmp = cupy.zeros((self.batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
 
         # Run permutations on GPU
-        n_batches = int(np.ceil(self.n_iters / batch_size))
+        n_batches = int(np.ceil(self.n_iters / self.batch_size))
         for batch_idx in tqdm(range(n_batches)): ## batches are run serially
-            batch_start = batch_idx * batch_size
-            batch_end = min((batch_idx + 1) * batch_size, self.n_iters)
+            batch_start = batch_idx * self.batch_size
+            batch_end = min((batch_idx + 1) * self.batch_size, self.n_iters)
             batch_n_iters = batch_end - batch_start
             d_batch_ijks = cupy.asarray(iter_ijks[batch_start:batch_end], dtype=cupy.int32)
             # initialze ma maps as zeros
@@ -890,10 +977,6 @@ class DeviceSCALE(DeviceMixin, SCALE):
 
 
         p_values, z_values = self._scale_to_p(self.stat_values, perm_scale_values)
-        if calculate_z_std:
-            # calculate Z scores based on true-mean(null)/std(null)
-            z_values_std = self._scale_to_z(self.stat_values, perm_scale_values)
-
         if self.keep_perm_nulls:
             self.null_distributions_["perm_scale_values"] = perm_scale_values
         else:
@@ -907,20 +990,9 @@ class DeviceSCALE(DeviceMixin, SCALE):
 
         # Write out unthresholded value images
         maps = {"stat": self.stat_values, "logp": logp_values, "z": z_values}
-        if calculate_z_std:
-            maps["z_std"] = z_values_std
         description = self._generate_description()
 
         return maps, {}, description
-    
-    def _scale_to_z(self, stat_values, perm_scale_values):
-        """Convert scale values to Z scores."""
-        z_values = (
-            (stat_values 
-            - np.mean(perm_scale_values, axis=0, keepdims=True)
-            ) / np.std(perm_scale_values, axis=0, keepdims=True)
-        )
-        return z_values
 
     def _scale_to_p(self, stat_values, scale_values, 
                     vox_batch_size=1000, n_elements_per_block=1000,
