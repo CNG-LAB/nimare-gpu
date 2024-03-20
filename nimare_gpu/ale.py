@@ -112,7 +112,7 @@ def compute_ma_gpu(
                         if vox!=-1: 
                             # using atomic max to prevent
                             # memory race (though is unlikely)
-                            cuda.atomic.max(ma_maps, (0, i_exp, vox), kernels[i_exp, xlk+xi, ylk+yi, zlk+zi])
+                            cuda.atomic.max(ma_maps, (i_perm, i_exp, vox), kernels[i_exp, xlk+xi, ylk+yi, zlk+zi])
 
 @cuda.jit(cache=False)
 def compute_hist(X, bins, n_bins, Y):
