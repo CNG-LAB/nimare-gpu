@@ -587,7 +587,7 @@ class DeviceALE(DeviceMixin, ALE):
                 )
                 # calculate ALE of current batch
                 ale_tmp[:, :] = \
-                    (1-cupy.prod((1 - d_ma_tmp), axis=1)).get()
+                        (1-cupy.prod(cupy.subtract(1, d_ma_tmp, out=d_ma_tmp), axis=1)).get()[:batch_n_iters]
                 
                 if keep_null_ales:
                     self.null_distributions_['ale'][batch_start:batch_end, :] = ale_tmp
@@ -968,7 +968,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
             # calculate ALE 
             # reuse the same array in each batch to save memory
             perm_scale_values[batch_start:batch_end, :] = \
-                (1-cupy.prod(cupy.subtract(1, d_ma_tmp, out=d_ma_tmp), axis=1)).get()
+                    (1-cupy.prod(cupy.subtract(1, d_ma_tmp, out=d_ma_tmp), axis=1)).get()[:batch_n_iters]
 
         # Free some GPU memory
         del d_batch_ijks, d_ma_tmp
