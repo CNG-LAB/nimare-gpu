@@ -288,8 +288,10 @@ class DeviceMixin:
         to voxel index in mask or -1 if voxel is outside mask
         """
         # get ijk of mask voxels
-        self.in_mask_voxels = np.array(np.where(self.masker.mask_img.get_fdata()==1)).T
+        self.in_mask_voxels = np.array(np.where(np.isclose(self.masker.mask_img.get_fdata(),1))).T
         self.n_voxels_in_mask = self.in_mask_voxels.shape[0]
+        if self.n_voxels_in_mask == 0:
+            raise ValueError("No voxels found in mask. The voxel values must be 0 and 1.")
         self._ALE__n_mask_voxels = self.n_voxels_in_mask # this name is used in nimare
         # create a mapping from xyz coordinates to voxel index in mask
         # or -1 if voxel is outside mask
