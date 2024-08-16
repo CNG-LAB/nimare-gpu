@@ -306,7 +306,32 @@ class DeviceMixin:
         self.d_mask_idx_mapping = cupy.asarray(self.mask_idx_mapping, dtype=cupy.int32) # the GPU copy
 
 class DeviceALE(DeviceMixin, ALE):
-    def _fit(self, dataset, use_cpu=False):
+    def __init__(self,
+                 sigma_scale=1.0,
+                 nbits=64,
+                 use_cpu=False,
+                 **kwargs):
+        """
+        Activation likelihood estimation on GPU.
+
+        Parameters
+        ----------
+        sigma_scale : :obj:`float`, optional
+            Scaling of the kernel sigma. Default is 1.0.
+        nbits: {32, 64}, optional
+            Precision of floating point numbers. Default is 64.
+            32-bit precision is faster and uses less memory.
+        use_cpu : :obj:`bool`, optional
+            Whether to use CPU instead of GPU for _fit. Default is False.
+        **kwargs
+            Keyword arguments passed to :class:`nimare.meta.cbma.ale.ALE`
+        """
+        self.sigma_scale = sigma_scale
+        self.use_cpu = use_cpu
+        self.set_dtype(nbits)
+        super().__init__(**kwargs)
+
+    def _fit(self, dataset):
         """Perform coordinate-based meta-analysis on dataset.
 
         Parameters
@@ -321,7 +346,7 @@ class DeviceALE(DeviceMixin, ALE):
         sigma_scale : :obj:`float`, optional
             Scaling factor for kernel sigma. Default is 1.0.
         """
-        if use_cpu:
+        if self.use_cpu:
             if self.sigma_scale != 1.0:
                 LGR.warn(
                     "sigma_scale is not used when use_cpu is True."
