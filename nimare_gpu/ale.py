@@ -765,6 +765,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
                  xyz=None,
                  sigma_scale=1.0,
                  keep_perm_nulls=False, 
+                 keep_voxel_hists=False,
                  use_cpu=False, 
                  batch_size=1,
                  use_mmap=False, 
@@ -783,20 +784,22 @@ class DeviceSCALE(DeviceMixin, SCALE):
         ----------
         approach : {'deterministic', 'probabilistic'}
             Approach to use for sampling null coordinates.
-        xyz: :obj:`np.ndarray` or None
-            xyz coordinates of foci used in the deterministic approach.
-            If None, all the voxels within the mask are used. Set to None
-            in the probabilistic approach.
         prob_map : :obj:`str`, :class:`~nibabel.nifti1.Nifti1Image`, or None
             Voxel-wise probability map used in the probabilistic approach.
             If None, assumes uniform probability. Set to None in the
             deterministic approach. It is assumed to be a whole-brain
             map, which will then be masked and normalized within the mask.
+        xyz: :obj:`np.ndarray` or None
+            xyz coordinates of foci used in the deterministic approach.
+            If None, all the voxels within the mask are used. Set to None
+            in the probabilistic approach.
         sigma_scale : :obj:`float`, optional
             Scaling of the kernel sigma. Default is 1.0.
         keep_perm_nulls : :obj:`bool`, optional
             Whether to keep the null MA maps in the ``null_distributions_`` attribute.
             Default is False.
+        keep_voxel_hists : :obj:`bool`, optional
+            Whether to keep the voxel-wise histograms in the ``null_distributions_`` attribute.
         use_cpu : :obj:`bool`, optional
         batch_size: :obj:`int`, optional
             Number of permutations to run in each batch on GPU. Default is 1.
@@ -826,6 +829,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
             prob_map = nib.load(prob_map)
         self.prob_map = prob_map
         self.keep_perm_nulls = keep_perm_nulls
+        self.keep_voxel_hists = keep_voxel_hists
         self.use_cpu = use_cpu
         self.batch_size = batch_size
         self.use_mmap = use_mmap
@@ -900,14 +904,15 @@ class DeviceSCALE(DeviceMixin, SCALE):
             self.masker.mask_img.shape[0], self.masker.mask_img.shape[1], self.masker.mask_img.shape[2],
             self.mid, self.mid+1
         )
+
         # copy MA maps to CPU
         # save ALE and MA as attributes for debugging
         self.ma_values = d_ma_values.get().squeeze()
+
         # calculate ALE and copy to CPU
         # reuse the same array in each batch to save memory
         self.stat_values = \
             (1-cupy.prod((1 - d_ma_values), axis=1)).get().squeeze()
-                
         
         # convert MA maps to sparse format so that it is compatible
         # with the original code
@@ -1088,7 +1093,8 @@ class DeviceSCALE(DeviceMixin, SCALE):
         bin_edges = cupy.asarray(bin_edges) # copy to GPU
         # initialize voxel histograms (of each batch) on GPU as zeros
         voxel_hists = cupy.zeros((vox_batch_size, n_bins), dtype=cupy.int32)
-        # all_voxel_hists = np.zeros((n_vox, n_bins), dtype=np.int32) # uncomment to keep all hists
+        if self.keep_voxel_hists:
+            all_voxel_hists = np.zeros((n_vox, n_bins), dtype=np.int32)
         p_values = np.zeros(n_vox)
         # get mempool for GPU memory management
         mempool = cupy.get_default_memory_pool() 
@@ -1129,12 +1135,17 @@ class DeviceSCALE(DeviceMixin, SCALE):
             )
             if batch_smallest_value < smallest_value:
                 smallest_value = batch_smallest_value
-            # all_voxel_hists[vox_start:vox_end, :] = voxel_hists_[:curr_batch_size, :] # uncomment to keep all hists
+            if self.keep_voxel_hists:
+                all_voxel_hists[vox_start:vox_end, :] = voxel_hists_[:curr_batch_size, :]
             # free GPU memory
             del voxel_nulls
             mempool.free_all_blocks()
+        # set -1 scale values back to 0
+        scale_values[scale_values==-1.0] = 0
         # set the min p-value to smallest value of null distribution
         p_values = np.maximum(p_values, smallest_value)
         # calculate z-values
         z_values = p_to_z(p_values, tail="one")
+        if self.keep_voxel_hists:
+            self.null_distributions_["voxel_hists"] = all_voxel_hists
         return p_values, z_values
