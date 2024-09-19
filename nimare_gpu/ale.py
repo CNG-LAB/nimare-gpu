@@ -613,11 +613,11 @@ class DeviceALE(DeviceMixin, ALE):
                     self.mid, self.mid+1
                 )
                 # calculate ALE of current batch
-                ale_tmp[:, :] = \
+                ale_tmp[:batch_n_iters, :] = \
                         (1-cupy.prod(cupy.subtract(1, d_ma_tmp, out=d_ma_tmp), axis=1)).get()[:batch_n_iters]
                 
                 if keep_null_ales:
-                    self.null_distributions_['ale'][batch_start:batch_end, :] = ale_tmp
+                    self.null_distributions_['ale'][batch_start:batch_end, :] = ale_tmp[:batch_n_iters, :]
                 
                 # get fwe_voxel_max, fwe_cluster_size_max and fwe_cluster_mass_max
                 # for each permutation in batch
