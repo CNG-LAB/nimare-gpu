@@ -416,12 +416,12 @@ class DeviceALE(DeviceMixin, ALE):
         coords = np.vstack((exp.flatten(), np.hstack(all_coords)))
         data = np.hstack(all_data).flatten()
         ma_maps_shape = (self.n_exp,)+self.masker.mask_img.shape # called kernel_shape in nimare
-        ma_values = sparse.COO(coords, data, shape=ma_maps_shape)
+        self.ma_values = sparse.COO(coords, data, shape=ma_maps_shape)
 
         # Determine null distributions for summary stat (OF) to p conversion
-        self._determine_histogram_bins(ma_values)
+        self._determine_histogram_bins(self.ma_values)
         if self.null_method.startswith("approximate"):
-            self._compute_null_approximate(ma_values)
+            self._compute_null_approximate(self.ma_values)
 
         elif self.null_method == "montecarlo":
             raise NotImplementedError("Monte Carlo null method not implemented for GPU.")
