@@ -9,7 +9,6 @@ setup(
     url='https://github.com/amnsbr/nimare-gpu',
     packages=find_packages(),
     install_requires=[
-        'NiMARE==0.2.0',
-        'nilearn==0.10.1'
+        'nimare>=0.2.0',
     ],
 )
