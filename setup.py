@@ -1,8 +1,10 @@
 from setuptools import setup, find_packages
+import versioneer
 
 setup(
     name='nimare-gpu',
-    version='0.0.1',
+    version=versioneer.get_version(),
+    cmdclass=versioneer.get_cmdclass(),
     description='A GPU wrapper for NiMARE',
     author='Amin Saberi', 
     author_email='amnsbr@gmail.com',
