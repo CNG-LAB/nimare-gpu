@@ -171,6 +171,18 @@ class DeviceMixin:
     d_float = cupy.float32
     c_float = np.float32
 
+    def __getstate__(self):
+        # copy GPU arrays to CPU when getting the state
+        # of the object (while pickling)
+        state = self.__dict__.copy()
+        
+        # convert CuPy arrays to NumPy arrays
+        for key, value in state.items():
+            if isinstance(value, cupy.ndarray):
+                state[key] = cupy.asnumpy(value) 
+        
+        return state
+
     def set_dtype(self, bits):
         """
         Set precision of floating point numbers to bits.
