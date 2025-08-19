@@ -317,9 +317,54 @@ class DeviceMixin:
             self.mask_idx_mapping[self.in_mask_voxels[i,0], self.in_mask_voxels[i,1], self.in_mask_voxels[i,2]] = i
         self.d_mask_idx_mapping = cupy.asarray(self.mask_idx_mapping, dtype=cupy.int32) # the GPU copy
 
+
+    def _determine_histogram_bins(self, ma_maps):
+        """
+        Determine histogram bins for null distribution methods.
+
+        Parameters
+        ----------
+        ma_maps : :obj:`sparse._coo.core.COO` or :obj:`numpy.ndarray`
+            MA maps.
+
+        Notes
+        -----
+        This method adds one entry to the null_distributions_ dict attribute: "histogram_bins".
+        This is an adaptation of `_determine_histogram_bins` from nimare.meta.cbma.ale.ALE.
+        Differences: i) INV_STEP_SIZE can be varied via `inv_step_size` attribute. ii)
+        """
+        # Determine bins for null distribution histogram
+        # Remember that numpy histogram bins are bin edges, not centers
+        # Assuming values of 0, .001, .002, etc., bins are -.0005-.0005, .0005-.0015, etc.
+        INV_STEP_SIZE = getattr(self, 'inv_step_size', 100000)
+        step_size = 1 / INV_STEP_SIZE
+        if isinstance(ma_maps, sparse._coo.core.COO):
+            assert ma_maps.ndim == 4, (
+                "When ma_maps is a COO array it must have 4 dimensions "
+                " (x, y, z, n_exp)."
+            )
+            max_ma_values = ma_maps.max(axis=[1, 2, 3]).todense()
+        elif isinstance(ma_maps, np.ndarray):
+            assert ma_maps.ndim == 2, (
+                "When ma_maps is a numpy array it must have 2 dimensions (n_exp, n_voxels_in_mask)."
+            )
+            max_ma_values = ma_maps.max(axis=1)
+        else:
+            raise ValueError(f"Unsupported data type '{type(ma_maps)}'")
+        # round up based on resolution
+        max_ma_values = np.ceil(max_ma_values * INV_STEP_SIZE) / INV_STEP_SIZE
+        max_poss_ale = self._compute_summarystat(max_ma_values)
+        # create bin centers
+        hist_bins = np.round(
+            np.arange(0, max_poss_ale + (1.5 * step_size), step_size),
+            int(np.round(np.log10(INV_STEP_SIZE)))
+        )
+        self.null_distributions_["histogram_bins"] = hist_bins
+
 class DeviceALE(DeviceMixin, ALE):
     def __init__(self,
                  sigma_scale=1.0,
+                 inv_step_size=10000,
                  nbits=64,
                  use_cpu=False,
                  **kwargs):
@@ -330,6 +375,8 @@ class DeviceALE(DeviceMixin, ALE):
         ----------
         sigma_scale : :obj:`float`, optional
             Scaling of the kernel sigma. Default is 1.0.
+        inv_step_size : :obj:`int`, optional
+            Inverse of the step size for histogram bins. Default is 10000.
         nbits: {32, 64}, optional
             Precision of floating point numbers. Default is 64.
             32-bit precision is faster and uses less memory.
@@ -339,6 +386,7 @@ class DeviceALE(DeviceMixin, ALE):
             Keyword arguments passed to :class:`nimare.meta.cbma.ale.ALE`
         """
         self.sigma_scale = sigma_scale
+        self.inv_step_size = inv_step_size
         self.use_cpu = use_cpu
         self.set_dtype(nbits)
         super().__init__(**kwargs)
@@ -437,7 +485,6 @@ class DeviceALE(DeviceMixin, ALE):
 
         elif self.null_method == "montecarlo":
             raise NotImplementedError("Monte Carlo null method not implemented for GPU.")
-
         else:
             raise NotImplementedError("Reduced Monte Carlo null method not implemented for GPU.")
 
@@ -776,6 +823,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
                  prob_map=None,
                  xyz=None,
                  sigma_scale=1.0,
+                 inv_step_size=10000,
                  keep_perm_nulls=False, 
                  keep_voxel_hists=False,
                  use_cpu=False, 
@@ -807,6 +855,8 @@ class DeviceSCALE(DeviceMixin, SCALE):
             in the probabilistic approach.
         sigma_scale : :obj:`float`, optional
             Scaling of the kernel sigma. Default is 1.0.
+        inv_step_size : :obj:`int`, optional
+            Inverse of the step size for histogram bins. Default is 10000.
         keep_perm_nulls : :obj:`bool`, optional
             Whether to keep the null MA maps in the ``null_distributions_`` attribute.
             Default is False.
@@ -846,6 +896,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
         self.batch_size = batch_size
         self.use_mmap = use_mmap
         self.sigma_scale = sigma_scale
+        self.inv_step_size = inv_step_size
         self.set_dtype(nbits)
 
     def _prepare_null_sampling(self):
@@ -926,40 +977,13 @@ class DeviceSCALE(DeviceMixin, SCALE):
         self.stat_values = \
             (1-cupy.prod((1 - d_ma_values), axis=1)).get().squeeze()
         
-        # convert MA maps to sparse format so that it is compatible
-        # with the original code
-        # following meta.utils.compute_ale_ma
-        # TODO: this is a significant bottleneck
-        # find a more efficient way to do this
-        all_exp = []
-        all_coords = []
-        all_data = []
-        for i_exp in range(self.n_exp):
-            nonzero_idx = np.where(self.ma_values[i_exp] > 0) # which in-mask voxels have non-zero MA in this experiment
-            nonzero_ijk = self.in_mask_voxels[nonzero_idx].T # what are their ijk coordinates
-            all_exp.append(np.full(nonzero_idx[0].shape[0], i_exp))
-            all_coords.append(nonzero_ijk)
-            all_data.append(self.ma_values[i_exp, nonzero_idx])
-        exp = np.hstack(all_exp)
-        coords = np.vstack((exp.flatten(), np.hstack(all_coords)))
-        data = np.hstack(all_data).flatten()
-        ma_maps_shape = (self.n_exp,)+self.masker.mask_img.shape # called kernel_shape in nimare
-        ma_values = sparse.COO(coords, data, shape=ma_maps_shape)
-
         # free GPU memory
         del d_ijks, d_ma_values
         mempool = cupy.get_default_memory_pool()
         mempool.free_all_blocks()
 
         # Determine bins for null distribution histogram
-        max_ma_values = ma_values.max(axis=[1, 2, 3]).todense()
-
-        max_poss_ale = self._compute_summarystat_est(max_ma_values)
-        self.null_distributions_["histogram_bins"] = np.round(
-            np.arange(0, max_poss_ale + 0.001, 0.0001), 4
-        )
-
-        del ma_values
+        self._determine_histogram_bins(self.ma_values)
 
         # Calculate null ALE maps for p-value calculation
         # sample random coordinates from self.xyz and 
