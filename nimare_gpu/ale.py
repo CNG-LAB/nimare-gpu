@@ -341,7 +341,7 @@ class DeviceMixin:
         if isinstance(ma_maps, sparse._coo.core.COO):
             assert ma_maps.ndim == 4, (
                 "When ma_maps is a COO array it must have 4 dimensions "
-                " (x, y, z, n_exp)."
+                " (n_exp, x, y, z)."
             )
             max_ma_values = ma_maps.max(axis=[1, 2, 3]).todense()
         elif isinstance(ma_maps, np.ndarray):
@@ -822,6 +822,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
                  approach,
                  prob_map=None,
                  xyz=None,
+                 p_value_method="direct",
                  sigma_scale=1.0,
                  inv_step_size=10000,
                  keep_perm_nulls=False, 
@@ -853,6 +854,13 @@ class DeviceSCALE(DeviceMixin, SCALE):
             xyz coordinates of foci used in the deterministic approach.
             If None, all the voxels within the mask are used. Set to None
             in the probabilistic approach.
+        p_value_method : {'direct', 'histogram'}, optional
+            Method to use for p-value calculation. Default is 'direct'.
+            If 'direct', p-values are calculated directly from the null distribution
+            (this fits JALE and Simon's approach).
+            Otherwise ('histogram'), following nimare's approach, a histogram
+            is created from the null distribution and p-values are calculated
+            from the histogram.
         sigma_scale : :obj:`float`, optional
             Scaling of the kernel sigma. Default is 1.0.
         inv_step_size : :obj:`int`, optional
@@ -890,8 +898,14 @@ class DeviceSCALE(DeviceMixin, SCALE):
         if isinstance(prob_map, str):
             prob_map = nib.load(prob_map)
         self.prob_map = prob_map
+        self.p_value_method = p_value_method
         self.keep_perm_nulls = keep_perm_nulls
         self.keep_voxel_hists = keep_voxel_hists
+        if (self.p_value_method == 'direct') & self.keep_voxel_hists:
+            raise ValueError(
+                "Cannot keep voxel-wise histograms when using direct p-value method. "
+                "Set keep_voxel_hists to False or use histogram p-value method."
+            )
         self.use_cpu = use_cpu
         self.batch_size = batch_size
         self.use_mmap = use_mmap
@@ -1062,17 +1076,95 @@ class DeviceSCALE(DeviceMixin, SCALE):
 
         return maps, {}, description
 
-    def _scale_to_p(self, stat_values, scale_values, 
-                    vox_batch_size=1000, n_elements_per_block=1000,
-                    use_cpu=False):
-        # added this temporarily to show tqdm for troubleshooting
-        """Compute p- and z-values.
+    def _scale_to_p(self, stat_values, perm_scale_values, **kwargs):
+        """
+        Compute p- and z-values.
+        This is just a dispatcher to `_scale_to_p_histogram` or
+        `_scale_to_p_direct` depending on the p_value_method.
 
         Parameters
         ----------
         stat_values : (V) array
             ALE values.
-        scale_values : (I x V) array
+        perm_scale_values : (I x V) array
+            Permutation ALE values.
+        kwargs : dict
+            Additional keyword arguments passed to the p-value
+            calculation methods.
+
+        Returns
+        -------
+        p_values : (V) array
+        z_values : (V) array
+        """
+        if self.p_value_method == "direct":
+            return self._scale_to_p_direct(
+                stat_values, perm_scale_values, **kwargs
+            )
+        elif self.p_value_method == "histogram":
+            return self._scale_to_p_histogram(
+                stat_values, perm_scale_values, **kwargs
+            )
+    
+    def _scale_to_p_direct(
+        self, stat_values, perm_scale_values, smallest_p_eps=False
+    ):
+        """
+        Compute p- and z-values using direct comparison method.
+
+        Parameters
+        ----------
+        stat_values : (V) array
+            ALE values.
+        perm_scale_values : (I x V) array
+            Permutation ALE values.
+        smallest_p_eps : :obj:`bool`, optional
+            If True, the smallest p-value will be 
+            set to the eps of float numbers. This
+            is similar to JALE's approach. Otherwise
+            (default) the smallest p-value is set to 1/(n_perm+1)
+            where n_perm is the number of permutations.
+
+        Returns
+        -------
+        p_values : (V) array
+            p-values for each voxel.
+        z_values : (V) array
+            z-values for each voxel.
+        """
+        if stat_values.ndim == 1:
+            stat_values = stat_values[None, :]
+
+        # calculate p-values following se scripts 
+        p_values = (perm_scale_values >= stat_values).mean(axis=0)
+        
+        # set smallest p
+        if smallest_p_eps:
+            # this follows jale and se scripts
+            smallest_p_value = np.finfo(float).eps
+        else:
+            # determine it based on number of iterations
+            smallest_p_value = 1 / self.n_iters
+        p_values[p_values < smallest_p_value] = smallest_p_value
+        
+        # calculate z-values
+        z_values = p_to_z(p_values, tail="one")
+        return p_values, z_values
+
+
+    def _scale_to_p_histogram(
+        self, stat_values, perm_scale_values, 
+        vox_batch_size=1000, n_elements_per_block=1000,
+        use_cpu=False
+    ):
+        """
+        Compute p- and z-values using histogram-based method of nimare.
+
+        Parameters
+        ----------
+        stat_values : (V) array
+            ALE values.
+        perm_scale_values : (I x V) array
             Permutation ALE values.
         vox_batch_size : :obj:`int`, optional
             Number of voxels to process in each batch. Default is 1000.
@@ -1086,18 +1178,14 @@ class DeviceSCALE(DeviceMixin, SCALE):
         -------
         p_values : (V) array
         z_values : (V) array
-
-        Notes
-        -----
-        This method also uses the "histogram_bins" element in the null_distributions_ attribute.
         """
         if self.use_cpu:
             # note that the results are not going to be identical
             # (with small number of permutations)
             # because of different treatment of min p-value
-            return super()._scale_to_p(stat_values, scale_values)
-        n_vox = scale_values.shape[1]
-        n_perm = scale_values.shape[0]
+            return super()._scale_to_p(stat_values, perm_scale_values)
+        n_vox = perm_scale_values.shape[1]
+        n_perm = perm_scale_values.shape[0]
         # calculate number of voxel batches and number of GPU blocks
         # needed per permutation
         n_batches = int(np.ceil(n_vox / vox_batch_size)) # batches of voxels
@@ -1111,9 +1199,9 @@ class DeviceSCALE(DeviceMixin, SCALE):
         # on GPU, i.e., np.NaN float value might be different
         # and I wouldn't trust it to do a value == np.NaN check
         # on the GPU kernel
-        scale_values[scale_values==0] = -1.0
+        perm_scale_values[perm_scale_values==0] = -1.0
         # count number of zeros in the permutations of each voxel
-        n_zeros = (scale_values==-1.0).sum(axis=0)
+        n_zeros = (perm_scale_values==-1.0).sum(axis=0)
         # define histogram bins
         n_bins = self.null_distributions_["histogram_bins"].shape[0]
         hist_min = np.min(self.null_distributions_["histogram_bins"])
@@ -1125,7 +1213,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
         # going to get the linspace of range and via _get_outer_edge do some
         # checks on the range, and if (a.min(), a.max()) is outside the range 
         # raise an error
-        bin_edges = _get_bin_edges(scale_values[:, 0], self.null_distributions_["histogram_bins"], (hist_min, hist_max), None)[0]
+        bin_edges = _get_bin_edges(perm_scale_values[:, 0], self.null_distributions_["histogram_bins"], (hist_min, hist_max), None)[0]
         bin_edges = cupy.asarray(bin_edges) # copy to GPU
         # initialize voxel histograms (of each batch) on GPU as zeros
         voxel_hists = cupy.zeros((vox_batch_size, n_bins), dtype=cupy.int32)
@@ -1146,7 +1234,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
             voxel_hists[:curr_batch_size, 0] = cupy.asarray(n_zeros[vox_start:vox_end], dtype=cupy.int32)
             # copy permutation ALE values of this batch to GPU
             # and reshape it to (n_vox, n_perm)
-            voxel_nulls = cupy.asarray(scale_values[:, vox_start:vox_end].T, dtype=self.d_float)
+            voxel_nulls = cupy.asarray(perm_scale_values[:, vox_start:vox_end].T, dtype=self.d_float)
             # call the historgram calculation kernel on GPU
             # with rows (voxels) distributed across grid.x
             # and observations (permutations) distributed across
@@ -1177,7 +1265,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
             del voxel_nulls
             mempool.free_all_blocks()
         # set -1 scale values back to 0
-        scale_values[scale_values==-1.0] = 0
+        perm_scale_values[perm_scale_values==-1.0] = 0
         # set the min p-value to smallest value of null distribution
         p_values = np.maximum(p_values, smallest_value)
         # calculate z-values
