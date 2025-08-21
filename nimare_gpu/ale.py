@@ -1,4 +1,5 @@
 import logging
+import gc
 import nibabel as nib
 import numpy as np
 from scipy import ndimage
@@ -40,7 +41,7 @@ def compute_ma_gpu(
     experiments (block.Y) and foci (thread)
 
     ma_maps: (cp.ndarray) (n_perm, n_exp, n_voxels_in_mask)
-        MA maps of the current batch of permutations for each experiment
+        output MA maps of the current batch of permutations for each experiment
     ijks: (cp.ndarray) (n_perm, n_peak, 3)
         ijk coordinates of peaks for each permutation (can be true or random)
     kernels: (cp.ndarray) (n_exp, kernel_size, kernel_size, kernel_size)
@@ -113,6 +114,70 @@ def compute_ma_gpu(
                             # using atomic max to prevent
                             # memory race (though is unlikely)
                             cuda.atomic.max(ma_maps, (i_perm, i_exp, vox), kernels[i_exp, xlk+xi, ylk+yi, zlk+zi])
+
+@cuda.jit(cache=False)
+def compute_p_nom_counts(p_nom_counts, perm_scale_values, n_perms, n_voxels):
+    """
+    Calculates the number of permutations with ALE values in `true_perm_idx`
+    (block y dimension) greater than the target `null_perm_idx` (block z dimension)
+    in `vox_idx` (determined based on block x dimension and thread indices).
+
+    Parameters
+    ----------
+    p_nom_counts: (cp.ndarray) (n_perms-1,n_voxels)
+        output counts used as the nominator in p-value calculation
+    perm_scale_values: (cp.ndarray) (n_perms, n_voxels)
+        data to calculate histogram of
+    n_perms: (int)
+        number of permutations
+    n_voxels: (int)
+        number of voxels
+    """
+    # determine true and null permutation indices
+    true_perm_idx = cuda.blockIdx.y
+    null_perm_idx = cuda.blockIdx.z
+    # guard against out-of-bound for true and null permutation index
+    # (this normally doesn't happen)
+    if true_perm_idx >= n_perms:
+        return
+    if null_perm_idx >= n_perms:
+        return
+    # skip the first permutation
+    # (as there is an extra number of permutations)
+    if true_perm_idx == 0:
+        return
+    # we don't want to include the true permutation
+    # in comparison nulls, as in this thread it is
+    # not considered a null
+    if true_perm_idx == null_perm_idx:
+        return
+    # determine voxel index
+    vox_idx = (
+        ( # index of first thread in the full grid
+            (cuda.blockDim.x * cuda.blockDim.y) # typically (16 * 16)
+            * cuda.blockIdx.x
+        ) + ( # current thread index in the current block
+            cuda.blockDim.x * cuda.threadIdx.x
+            + cuda.threadIdx.y
+        )
+    )
+    # guard against out-of-bound voxel index
+    if vox_idx >= n_voxels:
+        return
+    # calculation step is simple:
+    # just increment (atomically) the count if null ALE in
+    # current voxel is greater than or equal to
+    # true ALE
+    # TODO: when the goal is to determine p < p_unc for cluster
+    # forming and cFWE, stop the p-value calculation as soon as
+    # it reaches a count equivalent to p_unc, 
+    # as we're only interested in which voxel
+    # is significant, and not its p-value
+    if perm_scale_values[null_perm_idx, vox_idx] >= perm_scale_values[true_perm_idx, vox_idx]:
+        # Note: we are indexing p_nom_counts at [true_perm_idx-1] because
+        # we have discarded the first permutation in the counts, and are
+        # shifting the index of all permutations by one
+        cuda.atomic.add(p_nom_counts, (true_perm_idx-1, vox_idx), 1)
 
 @cuda.jit(cache=False)
 def compute_hist(X, bins, n_bins, Y):
@@ -692,14 +757,15 @@ class DeviceALE(DeviceMixin, ALE):
                         # convert 1D in-mask ALE array to 3D image data
                         # instead of using the slow self.masker.inverse_transform
                         # using much faster numpy indexing
-                        # here we append a NaN at the end of 1D ALE to fill background (index -1) with NaNs
-                        iter_ale_map = np.append(iter_ale_map, np.NaN)[self.mask_idx_mapping]
+                        # here we append a 0 at the end of 1D ALE to fill background (index -1) with 0s
+                        iter_ale_map = np.append(iter_ale_map, 0)[self.mask_idx_mapping]
                         # get cluster measures
                         fwe_cluster_size_max[i_iter+batch_start], fwe_cluster_mass_max[i_iter+batch_start] = _calculate_cluster_measures(
                             iter_ale_map, ss_thresh, d_conn, tail="upper"
                         )
             # Free some GPU memory
             del d_batch_ijks, d_ma_tmp
+            gc.collect()
             mempool = cupy.get_default_memory_pool()
             mempool.free_all_blocks()
 
@@ -825,7 +891,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
                  p_value_method="direct",
                  sigma_scale=1.0,
                  inv_step_size=10000,
-                 keep_perm_nulls=False, 
+                 keep_perm_nulls=True, 
                  keep_voxel_hists=False,
                  use_cpu=False, 
                  batch_size=1,
@@ -867,7 +933,8 @@ class DeviceSCALE(DeviceMixin, SCALE):
             Inverse of the step size for histogram bins. Default is 10000.
         keep_perm_nulls : :obj:`bool`, optional
             Whether to keep the null MA maps in the ``null_distributions_`` attribute.
-            Default is False.
+            This is required when FWE correction is going to be applied on this Estimator.
+            Default is True.
         keep_voxel_hists : :obj:`bool`, optional
             Whether to keep the voxel-wise histograms in the ``null_distributions_`` attribute.
         use_cpu : :obj:`bool`, optional
@@ -912,6 +979,14 @@ class DeviceSCALE(DeviceMixin, SCALE):
         self.sigma_scale = sigma_scale
         self.inv_step_size = inv_step_size
         self.set_dtype(nbits)
+        # set the actual number of iterations to 
+        # n_iters + 1, because in cFWE correction
+        # we need an extra permutation, so that
+        # each permutation can be compared to the other
+        # permutations for its p-value calculation
+        # in the p-value correction of true ALE map
+        # the last permutation is ignored
+        self._n_iters = self.n_iters + 1
 
     def _prepare_null_sampling(self):
         """Sets the xyz and sampling_prob attributes."""
@@ -993,6 +1068,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
         
         # free GPU memory
         del d_ijks, d_ma_values
+        gc.collect()
         mempool = cupy.get_default_memory_pool()
         mempool.free_all_blocks()
 
@@ -1004,7 +1080,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
         # transform them to ijk space
         rand_idx = np.random.choice(
             self.xyz.shape[0],
-            size=(self.inputs_["coordinates"].shape[0], self.n_iters),
+            size=(self.inputs_["coordinates"].shape[0], self._n_iters),
             p=self.sampling_prob
         )
         rand_xyz = self.xyz[rand_idx, :]
@@ -1019,20 +1095,20 @@ class DeviceSCALE(DeviceMixin, SCALE):
                 self.memmap_filenames[1],
                 dtype=self.c_float,
                 mode="w+",
-                shape=(self.n_iters, self.n_voxels_in_mask),
+                shape=(self._n_iters, self.n_voxels_in_mask),
             )
         else:
             # in RAM
-            perm_scale_values = np.zeros((self.n_iters, self.n_voxels_in_mask), dtype=self.c_float)
+            perm_scale_values = np.zeros((self._n_iters, self.n_voxels_in_mask), dtype=self.c_float)
         # allocated memory for MA maps of each batch permutations on GPU
         # this will be overwritten in each batch
         d_ma_tmp = cupy.zeros((self.batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
 
         # Run permutations on GPU
-        n_batches = int(np.ceil(self.n_iters / self.batch_size))
+        n_batches = int(np.ceil(self._n_iters / self.batch_size))
         for batch_idx in tqdm(range(n_batches)): ## batches are run serially
             batch_start = batch_idx * self.batch_size
-            batch_end = min((batch_idx + 1) * self.batch_size, self.n_iters)
+            batch_end = min((batch_idx + 1) * self.batch_size, self._n_iters)
             batch_n_iters = batch_end - batch_start
             d_batch_ijks = cupy.asarray(iter_ijks[batch_start:batch_end], dtype=cupy.int32)
             # initialze ma maps as zeros
@@ -1054,11 +1130,14 @@ class DeviceSCALE(DeviceMixin, SCALE):
 
         # Free some GPU memory
         del d_batch_ijks, d_ma_tmp
+        gc.collect()
         mempool = cupy.get_default_memory_pool()
         mempool.free_all_blocks()
 
-
-        p_values, z_values = self._scale_to_p(self.stat_values, perm_scale_values)
+        # calculate true p and z values. Here ignore the last
+        # permutation as it is calculated for the second level of
+        # permutations in FWE correction
+        p_values, z_values = self._scale_to_p(self.stat_values, perm_scale_values[:-1, :])
         if self.keep_perm_nulls:
             self.null_distributions_["perm_scale_values"] = perm_scale_values
         else:
@@ -1073,6 +1152,255 @@ class DeviceSCALE(DeviceMixin, SCALE):
         # Write out unthresholded value images
         maps = {"stat": self.stat_values, "logp": logp_values, "z": z_values}
         description = self._generate_description()
+
+        return maps, {}, description
+
+    def correct_fwe_montecarlo(
+        self,
+        result,
+        voxel_thresh=0.001,
+        n_iters=None,
+        n_cores=None,
+    ):
+        """
+        Perform cluster-level FWE correction using the max-value permutation 
+        method on a GPU device. It reuses the same null ALE maps calculated
+        in the first step (of calculating true p-value and z-value SALE maps)
+        for a second purpose of cluster-level FWE correction. In each permutation
+        it takes one of the nulls as the pretend-true ALE map and compares it
+        to the other nulls, to calculate a null p-value map (and a 1 - p-value map)
+        which is then used to calculate the null cluster statistics (size and mass),
+        against which the true clusters are compared.
+
+        Only call this method from within a Corrector.
+
+        Parameters
+        ----------
+        result : :obj:`~nimare.results.MetaResult`
+            Result object from a CBMA meta-analysis.
+        voxel_thresh : :obj:`float`, optional
+            Cluster-defining p-value threshold. Default is 0.001.
+        n_iters : :obj:`int`, optional
+            Number of iterations to build the voxel-level, cluster-size, and cluster-mass FWE
+            null distributions. Default (None) is the same number of iterations
+            used in the first level of permutations.
+            Currently non-default values are not supported.
+            This argument must be here as it is required by the 
+            ``nimare.correct.Corrector.transform`` method.
+        n_cores : :obj:`int`, optional
+            Number of CPU cores. This is not used and is here as it is required by the
+            ``nimare.correct.Corrector.transform`` method.
+
+        Returns
+        -------
+        images : :obj:`dict`
+            Dictionary of 1D arrays corresponding to masked images generated by
+            the correction procedure. The following arrays are generated by
+            this method:
+
+            -   ``logp_desc-size_level-cluster``: Cluster-level FWE-corrected ``-log10(p)`` map
+                based on cluster size. This was previously simply called "logp_level-cluster".
+            -   ``logp_desc-mass_level-cluster``: Cluster-level FWE-corrected ``-log10(p)`` map
+                based on cluster mass. According to :footcite:t:`bullmore1999global` and
+                :footcite:t:`zhang2009cluster`, cluster mass-based inference is more powerful than
+                cluster size.
+        description_ : :obj:`str`
+            A text description of the correction procedure.
+
+        Notes
+        -----
+        This method adds two new keys to the
+        ``null_distributions_`` attribute:
+            -   ``values_desc-size_level-cluster_corr-fwe_method-montecarlo``: The maximum cluster
+                size from each Monte Carlo iteration. An array of shape (n_iters,).
+            -   ``values_desc-mass_level-cluster_corr-fwe_method-montecarlo``: The maximum cluster
+                mass from each Monte Carlo iteration. An array of shape (n_iters,).
+        Note that unlike ALE FWE correction, this method does not do vFWE correction,
+        as the statistic compared between true and null maps here are voxel-wise 1-p
+        values which have a ceiling of 1, which can be easily reached by at least a
+        voxel in each null. This makes the vFWE method unsuitable for this approach.
+
+        Examples
+        --------
+        >>> meta = DeviceSCALE(...)
+        >>> result = meta.fit(dset)
+        >>> corrector = FWECorrector(method='montecarlo', voxel_thresh=0.01)
+        >>> cresult = corrector.transform(result)
+        """
+        assert self.keep_perm_nulls, \
+            "This method requires the Estimator to keep the null ALE maps. " \
+            "Set keep_perm_nulls=True in the Estimator."
+        assert n_iters is None or n_iters == self.n_iters, \
+            "Currently only the same number of iterations as used in the first level of " \
+            "permutations is supported. Set n_iters=None or to the same value as used in the first " \
+            "level of permutations in the Estimator."
+
+        # note that the number of iterations used in this level of permutations
+        # is one permutation less than the number of permutations calculated in the
+        # first level of permutations `_n_iters` while calling ._fit(), as in this method we are
+        # using each null ALE (except the first one) as a "true" ALE map
+        # in comparison to the other n_iters-1 null ALE maps, to calculate
+        # its corresponding p-value map and the resulting cluster statistics
+        n_iters = self.n_iters
+        # still in some of the arrays and calculations we should use the
+        # true (full) number of iterations
+        # (generally in indexing inputs we use n_iters_1 and in 
+        # outputs including count calculation, p-value calculation,
+        # and cluster calculaitons we use n_iters)
+        n_iters_1 = n_iters + 1
+
+        # make sure voxel threshold is not lower than the number of permutations
+        if voxel_thresh < 1 / n_iters_1:
+            raise ValueError(
+                f"Voxel threshold ({voxel_thresh}) cannot be lower than 1 / n_iters ({1 / n_iters_1}). "
+                "Please increase the voxel threshold."
+            )
+
+        stat_values = result.get_map("stat", return_type="array")
+
+        # define connectivity matrix for cluster labeling
+        d_conn = cupy_ndimage.generate_binary_structure(rank=3, connectivity=1) # on GPU: used in the loop
+        conn = ndimage.generate_binary_structure(rank=3, connectivity=1) # on CPU: used at the end
+
+        LGR.info(
+            "Calculating permutation p-values on GPU. "
+            "This may take a while depending on the number of iterations and the size of the mask."
+        )
+        # copy the null ALE stat maps to GPU
+        d_perm_scale_values = cupy.asarray(self.null_distributions_['perm_scale_values'])
+        # initialize p-value nominator counts on GPU
+        d_p_nom_counts = cupy.zeros((n_iters, self.n_voxels_in_mask), dtype=cupy.int32)
+
+        # set block and grid dimensions
+        block_dims = (16, 16)
+        # calcualte number of blocks needed for the voxels (in x dimension)
+        n_threads_per_block = np.prod(block_dims)
+        n_voxels = self.n_voxels_in_mask
+        n_voxel_blocks = np.ceil(n_voxels / n_threads_per_block).astype(int)
+        grid_dims = (n_voxel_blocks, n_iters_1, n_iters_1) 
+
+        # compute the p-value nominator counts
+        compute_p_nom_counts[
+            grid_dims,
+            block_dims
+        ](
+            d_p_nom_counts,
+            d_perm_scale_values,
+            n_iters_1,
+            n_voxels
+        )
+
+        # compute p-values from the nominator counts
+        # and copy to CPU
+        d_p_values = d_p_nom_counts / n_iters
+        null_p_values = d_p_values.get()
+
+        # initailize maximum cluster size and cluster mass arrays
+        fwe_cluster_size_max = np.zeros(n_iters)
+        fwe_cluster_mass_max = np.zeros(n_iters)
+
+        # get fwe_cluster_size_max and fwe_cluster_mass_max
+        # for each permutation in batch
+        for i_iter in tqdm(range(n_iters), desc="Calculating FWE null distributions"):
+            # Using 1 - p_value so higher values = more significant
+            # This is because clustering is done on map > thresh values
+            # TODO: alternatively Z-score can be used but
+            # since here we are simply comparing these to the true
+            # map p-value and p-Z have a monotonic inverse relationship
+            # we can use negative min p-values (instaed of positive max Z-scores)
+            # and avoid unncessary computations which increase compute time
+            iter_p_value_map = 1 - null_p_values[i_iter, :]
+            # convert 1D in-mask null p-values array to 3D image data
+            # instead of using the slow self.masker.inverse_transform
+            # using much faster numpy indexing
+            # here we append a 0 at the end of 1D ALE to fill background (index -1) with 0s
+            iter_p_value_map = np.append(iter_p_value_map, 0.0)[self.mask_idx_mapping]
+            # get cluster measures
+            # using 1-voxel_thresh as the threshold since p-value map is also converted to 1-p
+            fwe_cluster_size_max[i_iter], fwe_cluster_mass_max[i_iter] = _calculate_cluster_measures(
+                iter_p_value_map, 1-voxel_thresh, d_conn, tail="upper"
+            )
+        # Free some GPU memory
+        del d_p_nom_counts, d_perm_scale_values, d_p_values, d_conn
+        gc.collect()
+        mempool = cupy.get_default_memory_pool()
+        mempool.free_all_blocks()
+
+        # Cluster-level FWE
+
+        # TODO: the p-values calcualted on FWE level are based on null > true
+        # following nimare scripts, but in SALE's p-value calculation 
+        # we use null >= true, following se scripts.
+        # These should be consistent (even though they are not directly compared)
+
+        # Extract the true clusters based on 1-p values
+        # after transforming them from masked 1D array to 3D
+        true_logp = result.get_map("logp", return_type="array")
+        true_1_p = 1 - (10 ** (-true_logp))
+        thresh_1_p_values = np.append(true_1_p, 0.0)[self.mask_idx_mapping]
+        thresh_1_p_values[thresh_1_p_values <= 1-voxel_thresh] = 0
+        labeled_matrix, _ = ndimage.label(thresh_1_p_values, conn)
+
+        cluster_labels, idx, cluster_sizes = np.unique(
+            labeled_matrix,
+            return_inverse=True,
+            return_counts=True,
+        )
+        assert cluster_labels[0] == 0
+
+        # Cluster mass-based inference
+        cluster_masses = np.zeros(cluster_labels.shape)
+        for i_val in cluster_labels:
+            if i_val == 0:
+                cluster_masses[i_val] = 0
+
+            cluster_mass = np.sum(thresh_1_p_values[labeled_matrix == i_val] - (1-voxel_thresh))
+            cluster_masses[i_val] = cluster_mass
+
+        p_cmfwe_vals = null_to_p(cluster_masses, fwe_cluster_mass_max, "upper")
+        p_cmfwe_map = p_cmfwe_vals[np.reshape(idx, labeled_matrix.shape)]
+
+        p_cmfwe_values = np.squeeze(
+            self.masker.transform(
+                nib.Nifti1Image(p_cmfwe_map, self.masker.mask_img.affine)
+            )
+        )
+        logp_cmfwe_values = -np.log10(p_cmfwe_values)
+        logp_cmfwe_values[np.isinf(logp_cmfwe_values)] = -np.log10(np.finfo(float).eps)
+        z_cmfwe_values = p_to_z(p_cmfwe_values, tail="one")
+
+        # Cluster size-based inference
+        cluster_sizes[0] = 0  # replace background's "cluster size" with zeros
+        p_csfwe_vals = null_to_p(cluster_sizes, fwe_cluster_size_max, "upper")
+        p_csfwe_map = p_csfwe_vals[np.reshape(idx, labeled_matrix.shape)]
+
+        p_csfwe_values = np.squeeze(
+            self.masker.transform(
+                nib.Nifti1Image(p_csfwe_map, self.masker.mask_img.affine)
+            )
+        )
+        logp_csfwe_values = -np.log10(p_csfwe_values)
+        logp_csfwe_values[np.isinf(logp_csfwe_values)] = -np.log10(np.finfo(float).eps)
+        z_csfwe_values = p_to_z(p_csfwe_values, tail="one")
+
+        self.null_distributions_[
+            "values_desc-size_level-cluster_corr-fwe_method-montecarlo"
+        ] = fwe_cluster_size_max
+        self.null_distributions_[
+            "values_desc-mass_level-cluster_corr-fwe_method-montecarlo"
+        ] = fwe_cluster_mass_max
+
+        maps = {
+            "logp_desc-size_level-cluster": logp_csfwe_values,
+            "z_desc-size_level-cluster": z_csfwe_values,
+            "logp_desc-mass_level-cluster": logp_cmfwe_values,
+            "z_desc-mass_level-cluster": z_cmfwe_values,
+        }
+
+        # TODO: add more details to the description
+        description = (
+            "Family-wise error rate correction was performed using a Monte Carlo procedure."
+        )
 
         return maps, {}, description
 
@@ -1263,6 +1591,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
                 all_voxel_hists[vox_start:vox_end, :] = voxel_hists_[:curr_batch_size, :]
             # free GPU memory
             del voxel_nulls
+            gc.collect()
             mempool.free_all_blocks()
         # set -1 scale values back to 0
         perm_scale_values[perm_scale_values==-1.0] = 0
