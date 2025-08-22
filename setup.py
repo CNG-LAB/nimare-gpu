@@ -12,5 +12,6 @@ setup(
     packages=find_packages(),
     install_requires=[
         'nimare>=0.2.0',
+        'numpy<2'
     ],
 )
