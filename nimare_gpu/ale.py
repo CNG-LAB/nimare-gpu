@@ -565,7 +565,7 @@ class DeviceALE(DeviceMixin, ALE):
         voxel_thresh=0.001,
         n_iters=10000,
         n_cores=1,
-        batch_size=1,
+        batch_size='auto',
         vfwe_only=False,
         keep_null_ales=False,
     ):
@@ -590,13 +590,12 @@ class DeviceALE(DeviceMixin, ALE):
             Number of CPU cores to use for parallelization.
             If <=0, defaults to using all available cores. Default is 1.
             ** There must be one GPU device available to each CPU core. **
-        batch_size: :obj:`int`, optional
-            Number of permutations to run in each batch on GPU. Default is 1.
+        batch_size: {'auto', :obj:`int`}, optional
+            Number of permutations to run in each batch on GPU. Default is 'auto'
+            which sets the batch size based on the number of experiments and foci
+            and the available GPU memory.
             Generally a larger batch size is more efficient, but requires more
-            GPU memory. With larger number of experiments memory requirement
-            increases and the maximum possible batch size decreases.
-            For best performance, start with a higher batch size (e.g. 200)
-            and gradually decrease it until OutOfMemoryError is not raised.
+            GPU memory.
         vfwe_only : :obj:`bool`, optional
             If True, only calculate the voxel-level FWE-corrected maps. Voxel-level correction
             can be performed very quickly if the Estimator's ``null_method`` was "montecarlo".
@@ -701,13 +700,36 @@ class DeviceALE(DeviceMixin, ALE):
             d_conn = cupy_ndimage.generate_binary_structure(rank=3, connectivity=1) # used in the loop
             conn = ndimage.generate_binary_structure(rank=3, connectivity=1) # used at the end
 
+            # determine batch size
+            if batch_size == 'auto':
+                # get current free GPU memory and use 80% of it
+                free_mem, _ = cupy.cuda.runtime.memGetInfo()
+                usable_mem = int(free_mem * 0.8)
+                # calculate memory needed per iteration
+                mem_per_iter = (
+                    self.n_exp * self.n_voxels_in_mask * self.d_float().itemsize  # d_ma_tmp
+                    + self.inputs_["coordinates"].shape[0] * 3 * cupy.int32().itemsize  # d_batch_ijks (number of coordinates * 3 [i, j, k])
+                    + self.n_exp * self.n_voxels_in_mask * self.d_float().itemsize  # cupy.prod() call
+                )
+                # determine batch size (bounded between 1 and 1000)
+                _batch_size = min(1000, max(1, usable_mem // mem_per_iter))
+                LGR.info(
+                    f"Free GPU memory: {free_mem / 1024**3:.2f} GB "
+                    f"-> usable for permutations: {usable_mem / 1024**3:.2f} GB "
+                    f"-> memory needed per iteration: {mem_per_iter / 1024**2:.2f} MB"
+                    f"-> batch size: {_batch_size}"
+                )
+            else:
+                _batch_size = batch_size
+
+
             # initialize ALE maps of batch on CPU
             # (only including voxels in mask)
             # this will be overwritten in each batch
-            ale_tmp = np.ones((batch_size, self.n_voxels_in_mask), dtype=self.c_float)
+            ale_tmp = np.ones((_batch_size, self.n_voxels_in_mask), dtype=self.c_float)
             # allocated memory for MA maps of each batch permutations on GPU
             # this will be overwritten in each batch
-            d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
+            d_ma_tmp = cupy.zeros((_batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
 
             if keep_null_ales:
                 self.null_distributions_['ale'] = np.ones((n_iters, self.n_voxels_in_mask), dtype=self.c_float)
@@ -718,10 +740,10 @@ class DeviceALE(DeviceMixin, ALE):
             fwe_cluster_mass_max = np.zeros(n_iters)
 
             # Run permutations on GPU
-            n_batches = int(np.ceil(n_iters / batch_size))
+            n_batches = int(np.ceil(n_iters / _batch_size))
             for batch_idx in tqdm(range(n_batches)): ## batches are run serially
-                batch_start = batch_idx * batch_size
-                batch_end = min((batch_idx + 1) * batch_size, n_iters)
+                batch_start = batch_idx * _batch_size
+                batch_end = min((batch_idx + 1) * _batch_size, n_iters)
                 batch_n_iters = batch_end - batch_start
                 d_batch_ijks = cupy.asarray(iter_ijks[batch_start:batch_end], dtype=cupy.int32)
                 # initialze ma maps as zeros
@@ -894,7 +916,7 @@ class DeviceSCALE(DeviceMixin, SCALE):
                  keep_perm_nulls=True, 
                  keep_voxel_hists=False,
                  use_cpu=False, 
-                 batch_size=1,
+                 batch_size='auto',
                  use_mmap=False, 
                  nbits=64,
                  **kwargs):
@@ -938,13 +960,12 @@ class DeviceSCALE(DeviceMixin, SCALE):
         keep_voxel_hists : :obj:`bool`, optional
             Whether to keep the voxel-wise histograms in the ``null_distributions_`` attribute.
         use_cpu : :obj:`bool`, optional
-        batch_size: :obj:`int`, optional
-            Number of permutations to run in each batch on GPU. Default is 1.
+        batch_size: {'auto', :obj:`int`}, optional
+            Number of permutations to run in each batch on GPU. Default is 'auto'
+            which sets the batch size based on the number of experiments and foci
+            and the available GPU memory.
             Generally a larger batch size is more efficient, but requires more
-            GPU memory. With larger number of experiments memory requirement
-            increases and the maximum possible batch size decreases.
-            For best performance, start with a higher batch size (e.g. 200)
-            and gradually decrease it until OutOfMemoryError is not raised.
+            GPU memory.
         use_mmap: :obj:`bool`, optional
             Whether to use memory-mapped arrays for the null MA maps.
             Default is False. Note that it slows down the permutations
@@ -1100,15 +1121,38 @@ class DeviceSCALE(DeviceMixin, SCALE):
         else:
             # in RAM
             perm_scale_values = np.zeros((self._n_iters, self.n_voxels_in_mask), dtype=self.c_float)
+
+        # determine batch size
+        if self.batch_size == 'auto':
+            # get current free GPU memory and use 80% of it
+            free_mem, _ = cupy.cuda.runtime.memGetInfo()
+            usable_mem = int(free_mem * 0.8)
+            # calculate memory needed per iteration
+            mem_per_iter = (
+                self.n_exp * self.n_voxels_in_mask * self.d_float().itemsize  # ma_tmp
+                + self.inputs_["coordinates"].shape[0] * 3 * cupy.int32().itemsize  # d_batch_ijks (number of coordinates * 3 [i, j, k])
+                + self.n_exp * self.n_voxels_in_mask * self.d_float().itemsize  # cupy.prod() call
+            )
+            # determine batch size (bounded between 1 and 1000)
+            batch_size = min(1000, max(1, usable_mem // mem_per_iter))
+            LGR.info(
+                f"Free GPU memory: {free_mem / 1024**3:.2f} GB "
+                f"-> usable for permutations: {usable_mem / 1024**3:.2f} GB "
+                f"-> memory needed per iteration: {mem_per_iter / 1024**2:.2f} MB"
+                f"-> batch size: {batch_size}"
+            )
+        else:
+            batch_size = self.batch_size
+
         # allocated memory for MA maps of each batch permutations on GPU
         # this will be overwritten in each batch
-        d_ma_tmp = cupy.zeros((self.batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
+        d_ma_tmp = cupy.zeros((batch_size, self.n_exp, self.n_voxels_in_mask), dtype=self.d_float)
 
         # Run permutations on GPU
-        n_batches = int(np.ceil(self._n_iters / self.batch_size))
+        n_batches = int(np.ceil(self._n_iters / batch_size))
         for batch_idx in tqdm(range(n_batches)): ## batches are run serially
-            batch_start = batch_idx * self.batch_size
-            batch_end = min((batch_idx + 1) * self.batch_size, self._n_iters)
+            batch_start = batch_idx * batch_size
+            batch_end = min((batch_idx + 1) * batch_size, self._n_iters)
             batch_n_iters = batch_end - batch_start
             d_batch_ijks = cupy.asarray(iter_ijks[batch_start:batch_end], dtype=cupy.int32)
             # initialze ma maps as zeros
